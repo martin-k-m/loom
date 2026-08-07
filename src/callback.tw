@@ -1,0 +1,638 @@
+mode systems
+
+# callback.tw: hook points, the order callbacks run in, and the callbacks.
+#
+# ============================================================================
+# Hook points
+# ============================================================================
+#
+# There are seven, and no others. A callback is called at each one with the
+# whole Run, and the run's structure guarantees when each fires:
+#
+#   HOOK_RUN_BEGIN     once, before the first epoch. After a restore, so a
+#                      resumed run sees the restored epoch and lr here.
+#   HOOK_EPOCH_BEGIN   once per epoch, after the epoch seed is set and after
+#                      the row order is drawn, before the first batch.
+#   HOOK_BATCH_BEGIN   before each optimiser step. State.lr read by the step is
+#                      the value this hook leaves behind, so a per-update
+#                      schedule belongs here.
+#   HOOK_BATCH_END     after each optimiser step, with State.train_loss holding
+#                      the running epoch mean, not the batch loss.
+#   HOOK_EVAL_END      after a validation pass, with State.val populated. Fires
+#                      only on epochs where evaluation ran, so a callback that
+#                      monitors a validation metric must live here and not on
+#                      HOOK_EPOCH_END, where the metric may be one epoch stale.
+#   HOOK_EPOCH_END     after the epoch, after any evaluation. State.epoch has
+#                      already been incremented, so it is the number of epochs
+#                      whose updates are in the parameters.
+#   HOOK_RUN_END       once, after the loop, whether it ended by exhausting the
+#                      epochs or by an early stop.
+#
+# ============================================================================
+# Ordering
+# ============================================================================
+#
+# Ambiguous callback ordering is a silent-bug generator, so the order here is
+# total and it is not the order the caller listed them in.
+#
+# Each callback carries an `order` band. Within a hook, callbacks run by
+# ascending band, and ties break by position in the caller's array, which is
+# stable. Begin hooks run in that order and end hooks run in the reverse of it,
+# so a callback that wraps another at BATCH_BEGIN still wraps it at BATCH_END.
+#
+# The bands, and why they are in this order:
+#
+#   ORDER_SCHEDULE   10  writes State.lr. It runs first so that everything
+#                        after it, including the step, sees the rate that this
+#                        epoch will actually train at rather than the last
+#                        one's.
+#   ORDER_EARLY_STOP 20  writes State.stop and owns "is this the best epoch so
+#                        far". It runs before the checkpoint because the
+#                        checkpoint asks it that question.
+#   ORDER_CHECKPOINT 30  reads parameters and the best flag, writes a file.
+#                        After early stopping, so the epoch that triggers a
+#                        stop is still written; before logging, so the log line
+#                        can name the file.
+#   ORDER_LOG        40  reads only.
+#   ORDER_PROGRESS   50  reads only, and prints last so its line is the final
+#                        one for the epoch.
+#
+# The rule that makes this maintainable: a callback that writes to State must
+# have a lower band than every callback that reads what it wrote, and two
+# callbacks must never write the same field. Both are checked by
+# `validate` below, at the start of the run, rather than left to review.
+#
+# ============================================================================
+# Representation
+# ============================================================================
+#
+# One flat struct with a `kind` discriminant and the union of every callback's
+# fields. This is not the design anyone wants. With sum types it would be an
+# enum with a payload per variant and `fire` would be a match the checker
+# proves exhaustive; with function values in struct fields it would be a record
+# of closures. Neither is available (docs/needs.md entries 3 and 5), and a flat
+# struct is at least honest about it: every field is visible, and the fields a
+# given kind ignores are ignored in one place, in `fire`.
+
+import "state.tw" as st
+import "metrics.tw" as met
+import "checkpoint.tw" as ckpt
+import "report.tw" as rep
+
+let HOOK_RUN_BEGIN = 0
+let HOOK_EPOCH_BEGIN = 1
+let HOOK_BATCH_BEGIN = 2
+let HOOK_BATCH_END = 3
+let HOOK_EVAL_END = 4
+let HOOK_EPOCH_END = 5
+let HOOK_RUN_END = 6
+
+fn is_end_hook(hook: I64) -> Bool {
+  hook == HOOK_BATCH_END or hook == HOOK_EVAL_END
+    or hook == HOOK_EPOCH_END or hook == HOOK_RUN_END
+}
+
+let ORDER_SCHEDULE = 10
+let ORDER_EARLY_STOP = 20
+let ORDER_CHECKPOINT = 30
+let ORDER_LOG = 40
+let ORDER_PROGRESS = 50
+
+let KIND_SCHEDULE = 1
+let KIND_EARLY_STOP = 2
+let KIND_CHECKPOINT = 3
+let KIND_LOG = 4
+let KIND_PROGRESS = 5
+
+# Schedule shapes.
+let SCHED_CONST = 0
+let SCHED_STEP = 1
+let SCHED_EXP = 2
+let SCHED_COSINE = 3
+let SCHED_PLATEAU = 4
+
+struct Callback {
+  kind: I64,
+  name: Str,
+  order: I64,
+
+  # Which metric this callback watches, and which way is better. `monitor` is
+  # a name in State.val, or the literal "train_loss".
+  monitor: Str,
+  higher_is_better: Bool,
+  # An improvement smaller than min_delta is not an improvement. Without it,
+  # floating-point noise in the fourth decimal resets the patience counter
+  # forever and early stopping never fires.
+  min_delta: F64,
+  patience: I64,
+  wait: I64,
+  best: F64,
+  best_epoch: I64,
+  # False until the first observation, because there is no sentinel that is
+  # safely worse than every possible metric value: a loss can be negative and
+  # an accuracy cannot exceed one, so a shared "worst" constant is wrong for
+  # one of them.
+  seen: Bool,
+  improved: Bool,
+
+  # Checkpoint.
+  path: Str,
+  best_path: Str,
+  every: I64,
+  best_only: Bool,
+
+  # Schedule.
+  sched: I64,
+  base_lr: F64,
+  factor: F64,
+  step_size: I64,
+  min_lr: F64,
+  warmup: I64,
+  horizon: I64,
+
+  # Reporting.
+  json: Bool,
+  bar_width: I64,
+  batch_every: I64,
+}
+
+fn blank(kind: I64, name: Str, order: I64) -> Callback {
+  Callback {
+    kind: kind, name: name, order: order,
+    monitor: "loss", higher_is_better: false, min_delta: 0.0,
+    patience: 0, wait: 0, best: 0.0, best_epoch: 0, seen: false, improved: false,
+    path: "", best_path: "", every: 1, best_only: false,
+    sched: SCHED_CONST, base_lr: 0.0, factor: 1.0, step_size: 1,
+    min_lr: 0.0, warmup: 0, horizon: 0,
+    json: false, bar_width: 24, batch_every: 0,
+  }
+}
+
+# ---- constructors ---------------------------------------------------------
+
+# Stop when `monitor` has not improved by at least min_delta for `patience`
+# consecutive evaluations. Counted in evaluations, not epochs: with
+# Config.eval_every of 2, a patience of 3 is six epochs, and saying so here is
+# cheaper than the surprise later.
+fn early_stopping(monitor: Str, higher_is_better: Bool, patience: I64, min_delta: F64) -> Callback {
+  let c = blank(KIND_EARLY_STOP, "early_stopping", ORDER_EARLY_STOP)
+  c.monitor = monitor
+  c.higher_is_better = higher_is_better
+  c.patience = patience
+  c.min_delta = min_delta
+  c
+}
+
+# Write a checkpoint every `every` epochs. With best_only, also maintain a
+# separate file holding the best epoch's parameters, which is the file worth
+# deploying. The periodic file is the one worth resuming from, and they are
+# different files on purpose: the best epoch's optimiser state is not the state
+# training should continue from once training has moved past it.
+fn checkpointing(path: Str, every: I64, best_only: Bool, monitor: Str, higher_is_better: Bool) -> Callback {
+  let c = blank(KIND_CHECKPOINT, "checkpoint", ORDER_CHECKPOINT)
+  c.path = path
+  c.best_path = path + ".best"
+  c.every = every
+  c.best_only = best_only
+  c.monitor = monitor
+  c.higher_is_better = higher_is_better
+  c
+}
+
+# Multiply the rate by `factor` every `step_size` epochs.
+fn step_lr(base_lr: F64, factor: F64, step_size: I64) -> Callback {
+  let c = blank(KIND_SCHEDULE, "step_lr", ORDER_SCHEDULE)
+  c.sched = SCHED_STEP
+  c.base_lr = base_lr
+  c.factor = factor
+  c.step_size = step_size
+  c
+}
+
+fn exp_lr(base_lr: F64, factor: F64) -> Callback {
+  let c = blank(KIND_SCHEDULE, "exp_lr", ORDER_SCHEDULE)
+  c.sched = SCHED_EXP
+  c.base_lr = base_lr
+  c.factor = factor
+  c
+}
+
+# Cosine decay from base_lr to min_lr over `horizon` epochs, with a linear
+# warmup over the first `warmup`. The warmup is a ramp from zero rather than
+# from min_lr because the point of it is that the first updates, taken while
+# adam's second moment estimate is built from one or two batches, are small.
+fn cosine_lr(base_lr: F64, min_lr: F64, horizon: I64, warmup: I64) -> Callback {
+  let c = blank(KIND_SCHEDULE, "cosine_lr", ORDER_SCHEDULE)
+  c.sched = SCHED_COSINE
+  c.base_lr = base_lr
+  c.min_lr = min_lr
+  c.horizon = horizon
+  c.warmup = warmup
+  c
+}
+
+# Cut the rate when the monitored metric stalls. Shares the improvement logic
+# with early stopping, and runs in the schedule band, which means it decides on
+# the previous evaluation's verdict. That is one evaluation late by
+# construction: a callback cannot both act on this epoch's metric and set the
+# rate this epoch trains at.
+fn plateau_lr(monitor: Str, higher_is_better: Bool, factor: F64, patience: I64, min_lr: F64) -> Callback {
+  let c = blank(KIND_SCHEDULE, "plateau_lr", ORDER_SCHEDULE)
+  c.sched = SCHED_PLATEAU
+  c.monitor = monitor
+  c.higher_is_better = higher_is_better
+  c.factor = factor
+  c.patience = patience
+  c.min_lr = min_lr
+  c
+}
+
+fn metric_log(json: Bool) -> Callback {
+  let c = blank(KIND_LOG, "metric_log", ORDER_LOG)
+  c.json = json
+  c
+}
+
+fn progress(bar_width: I64, batch_every: I64) -> Callback {
+  let c = blank(KIND_PROGRESS, "progress", ORDER_PROGRESS)
+  c.bar_width = bar_width
+  c.batch_every = batch_every
+  c
+}
+
+# ---- ordering -------------------------------------------------------------
+
+# An insertion sort by (order, original index). Insertion sort because a
+# callback list is under ten entries, and stable because the tie-break is the
+# documented one.
+fn ordered(cbs: Arr[Callback]) -> Arr[Callback] {
+  let out: Arr[Callback] = []
+  let i = 0
+  while i < len(cbs) {
+    push(out, cbs[i])
+    let j = len(out) - 1
+    while j > 0 and out[j - 1].order > out[j].order {
+      let tmp = out[j - 1]
+      out[j - 1] = out[j]
+      out[j] = tmp
+      j = j - 1
+    }
+    i = i + 1
+  }
+  out
+}
+
+# The two ordering rules, checked once at the start of a run instead of trusted.
+# Returns an error string, empty when the set is sound.
+fn validate(cbs: Arr[Callback]) -> Str {
+  let schedules = 0
+  let stoppers = 0
+  let i = 0
+  while i < len(cbs) {
+    let c = cbs[i]
+    if c.kind == KIND_SCHEDULE {
+      schedules = schedules + 1
+    }
+    if c.kind == KIND_EARLY_STOP {
+      stoppers = stoppers + 1
+    }
+    if c.order < ORDER_SCHEDULE or c.order > ORDER_PROGRESS {
+      return "callback " + c.name + " has order " + str(c.order)
+        + ", outside the documented bands 10..50"
+    }
+    i = i + 1
+  }
+  # Two schedules both writing State.lr is the ordering bug this whole file is
+  # arranged to prevent, and the result would depend on their relative bands,
+  # which the caller did not choose. Refuse it.
+  if schedules > 1 {
+    return "two learning-rate schedules are registered; both write State.lr"
+  }
+  if stoppers > 1 {
+    return "two early-stopping callbacks are registered; both write State.stop"
+  }
+  ""
+}
+
+# ---- dispatch -------------------------------------------------------------
+
+# `cbs` must already be through `ordered`. The trainer does that once, at
+# HOOK_RUN_BEGIN, so the order cannot drift between hooks.
+#
+# `fire` takes the whole array and an index rather than one callback, because a
+# checkpointing callback has to pack every callback's state, including its own.
+# A callback that could only see itself would write a checkpoint that silently
+# dropped the early stopper's patience counter.
+fn dispatch(cbs: Arr[Callback], r: st.Run, hook: I64) {
+  if is_end_hook(hook) {
+    let i = len(cbs) - 1
+    while i >= 0 {
+      fire(cbs, i, r, hook)
+      i = i - 1
+    }
+    return
+  }
+  let i = 0
+  while i < len(cbs) {
+    fire(cbs, i, r, hook)
+    i = i + 1
+  }
+}
+
+# ---- behaviour ------------------------------------------------------------
+
+# The monitored value. "train_loss" reads the epoch's weighted running mean;
+# anything else is a name in the validation meter set. A monitor naming a
+# metric that was never recorded reads as 0.0, which would look like a
+# spectacular loss, so `observe` refuses to act on an unseen name instead.
+fn monitored(r: st.Run, name: Str) -> F64 {
+  if name == "train_loss" {
+    return r.st.train_loss
+  }
+  met.value_named(r.st.val, name)
+}
+
+fn monitor_available(r: st.Run, name: Str) -> Bool {
+  if name == "train_loss" {
+    return true
+  }
+  met.has(r.st.val, name)
+}
+
+# Update a callback's best/wait pair from the current metric. Shared by early
+# stopping, plateau scheduling and best-only checkpointing so that all three
+# agree on what "improved" means; three separate definitions of it in one
+# framework is how a checkpoint ends up holding an epoch early stopping did not
+# consider best.
+fn observe(c: Callback, r: st.Run) {
+  c.improved = false
+  if not monitor_available(r, c.monitor) {
+    return
+  }
+  let v = monitored(r, c.monitor)
+  if not c.seen {
+    c.seen = true
+    c.best = v
+    c.best_epoch = r.st.epoch
+    c.improved = true
+    c.wait = 0
+    return
+  }
+  let better = false
+  if c.higher_is_better {
+    better = v > c.best + c.min_delta
+  } else {
+    better = v < c.best - c.min_delta
+  }
+  if better {
+    c.best = v
+    c.best_epoch = r.st.epoch
+    c.improved = true
+    c.wait = 0
+  } else {
+    c.wait = c.wait + 1
+  }
+}
+
+fn fire(cbs: Arr[Callback], at: I64, r: st.Run, hook: I64) {
+  let c = cbs[at]
+  if c.kind == KIND_SCHEDULE {
+    fire_schedule(c, r, hook)
+    return
+  }
+  if c.kind == KIND_EARLY_STOP {
+    fire_early_stop(c, r, hook)
+    return
+  }
+  if c.kind == KIND_CHECKPOINT {
+    fire_checkpoint(c, cbs, r, hook)
+    return
+  }
+  if c.kind == KIND_LOG {
+    fire_log(c, r, hook)
+    return
+  }
+  if c.kind == KIND_PROGRESS {
+    fire_progress(c, r, hook)
+  }
+}
+
+fn fire_schedule(c: Callback, r: st.Run, hook: I64) {
+  if hook == HOOK_RUN_BEGIN {
+    if c.base_lr == 0.0 {
+      c.base_lr = r.cfg.lr
+    }
+    if c.sched == SCHED_PLATEAU {
+      # A plateau schedule carries the rate itself, so a resumed run keeps the
+      # cuts it had already made rather than starting from base_lr again.
+      if r.st.lr > 0.0 {
+        c.base_lr = r.st.lr
+      }
+      r.st.lr = c.base_lr
+      return
+    }
+  }
+  if hook == HOOK_EVAL_END and c.sched == SCHED_PLATEAU {
+    observe(c, r)
+    # `wait > patience`, the same comparison early stopping uses. Two callbacks
+    # in one framework disagreeing about what a patience of 2 means is exactly
+    # the kind of thing nobody notices until a run cuts its rate one epoch
+    # before it stops.
+    if not c.improved and c.wait > c.patience {
+      let next = c.base_lr * c.factor
+      if next < c.min_lr {
+        next = c.min_lr
+      }
+      c.base_lr = next
+      c.wait = 0
+    }
+    return
+  }
+  if hook != HOOK_EPOCH_BEGIN and hook != HOOK_RUN_BEGIN {
+    return
+  }
+  r.st.lr = lr_at(c, r.st.epoch)
+}
+
+# The rate for a given epoch, as a pure function. Written this way so that a
+# schedule can be plotted and tested without running a trainer, and so that a
+# resumed run computes the same rate the uninterrupted one would have, rather
+# than the rate it happens to have decayed to.
+fn lr_at(c: Callback, epoch: I64) -> F64 {
+  if c.sched == SCHED_CONST {
+    return c.base_lr
+  }
+  if c.sched == SCHED_PLATEAU {
+    return c.base_lr
+  }
+  if epoch < c.warmup {
+    return c.base_lr * f64(epoch + 1) / f64(c.warmup + 1)
+  }
+  if c.sched == SCHED_STEP {
+    let drops = epoch / c.step_size
+    let lr = c.base_lr
+    let i = 0
+    while i < drops {
+      lr = lr * c.factor
+      i = i + 1
+    }
+    return clamp_lr(lr, c.min_lr)
+  }
+  if c.sched == SCHED_EXP {
+    let lr = c.base_lr
+    let i = 0
+    while i < epoch {
+      lr = lr * c.factor
+      i = i + 1
+    }
+    return clamp_lr(lr, c.min_lr)
+  }
+  if c.sched == SCHED_COSINE {
+    let span = c.horizon - c.warmup
+    if span <= 0 {
+      return c.base_lr
+    }
+    let t = f64(epoch - c.warmup) / f64(span)
+    if t > 1.0 {
+      t = 1.0
+    }
+    let cosv = item(cos(scalar(3.14159265358979 * t)))
+    return c.min_lr + (c.base_lr - c.min_lr) * 0.5 * (1.0 + cosv)
+  }
+  c.base_lr
+}
+
+fn clamp_lr(lr: F64, min_lr: F64) -> F64 {
+  if lr < min_lr {
+    return min_lr
+  }
+  lr
+}
+
+fn fire_early_stop(c: Callback, r: st.Run, hook: I64) {
+  # On HOOK_EVAL_END, so a validation metric is judged the moment it exists.
+  # A monitor of "train_loss" is judged there too, which means it is judged on
+  # evaluation epochs only. That is deliberate: mixing the two cadences would
+  # make patience mean different numbers of epochs for different monitors.
+  if hook != HOOK_EVAL_END {
+    return
+  }
+  observe(c, r)
+  if not c.seen {
+    return
+  }
+  if c.wait > c.patience {
+    r.st.stop = true
+    r.st.stop_reason = c.monitor + " has not improved for "
+      + str(c.wait) + " evaluations; best was "
+      + rep.fixed(c.best, 4) + " at epoch " + str(c.best_epoch)
+  }
+}
+
+fn fire_checkpoint(c: Callback, cbs: Arr[Callback], r: st.Run, hook: I64) {
+  if hook == HOOK_EVAL_END {
+    # Track the best separately from the early stopper's copy. They use the
+    # same `observe`, so they cannot disagree, but a run may have one without
+    # the other.
+    if c.best_only {
+      observe(c, r)
+    }
+    return
+  }
+  if hook != HOOK_EPOCH_END {
+    return
+  }
+  # The periodic checkpoint carries callback state and the best-only one does
+  # not. The best file is for deployment; resuming from it would restore a
+  # patience counter belonging to an epoch the run has already moved past, and
+  # the run would stop earlier than it should.
+  let none: Arr[F64] = []
+  if c.best_only and c.improved {
+    ckpt.write(r, none, r.st.rows, c.best_path, "best " + c.monitor)
+    r.st.best_path = c.best_path
+  }
+  if c.every > 0 and r.st.epoch % c.every == 0 {
+    ckpt.write(r, pack_state(cbs), r.st.rows, c.path, "periodic")
+  }
+}
+
+fn fire_log(c: Callback, r: st.Run, hook: I64) {
+  if hook == HOOK_EPOCH_END {
+    if c.json {
+      print(rep.epoch_json(r.st))
+    } else {
+      print(rep.epoch_line(r.st))
+    }
+    return
+  }
+  if hook == HOOK_RUN_END and len(r.st.stop_reason) > 0 {
+    print("stopped: " + r.st.stop_reason)
+  }
+}
+
+fn fire_progress(c: Callback, r: st.Run, hook: I64) {
+  if not r.cfg.verbose {
+    return
+  }
+  if hook == HOOK_BATCH_END and c.batch_every > 0 {
+    if r.st.batch % c.batch_every == 0 {
+      print(rep.epoch_label(r.st.epoch + 1, r.st.epochs) + "  "
+        + rep.bar(r.st.batch + 1, r.st.batches, c.bar_width)
+        + "  loss " + rep.fixed(r.st.train_loss, 4))
+    }
+    return
+  }
+  if hook == HOOK_EPOCH_END {
+    print(rep.epoch_label(r.st.epoch, r.st.epochs) + "  "
+      + rep.bar(r.st.epoch, r.st.epochs, c.bar_width)
+      + "  loss " + rep.fixed(r.st.train_loss, 4))
+  }
+}
+
+# ---- checkpointable callback state ----------------------------------------
+
+# Packed positionally, five numbers per callback, in the order `cbs` is given.
+# Restoring into a differently ordered or differently sized list is refused
+# rather than misassigned, because a patience counter landing on the wrong
+# callback is invisible until it stops a run early.
+let PACK_STRIDE = 5
+
+fn pack_state(cbs: Arr[Callback]) -> Arr[F64] {
+  let out: Arr[F64] = []
+  let i = 0
+  while i < len(cbs) {
+    let c = cbs[i]
+    push(out, f64(c.kind))
+    push(out, f64(c.wait))
+    push(out, c.best)
+    push(out, f64(c.best_epoch))
+    if c.seen {
+      push(out, 1.0)
+    } else {
+      push(out, 0.0)
+    }
+    i = i + 1
+  }
+  out
+}
+
+fn unpack_state(cbs: Arr[Callback], packed: Arr[F64]) -> Str {
+  if len(packed) != len(cbs) * PACK_STRIDE {
+    return "checkpoint holds state for " + str(len(packed) / PACK_STRIDE)
+      + " callbacks and this run registers " + str(len(cbs))
+  }
+  let i = 0
+  while i < len(cbs) {
+    let base = i * PACK_STRIDE
+    if i64(packed[base]) != cbs[i].kind {
+      return "checkpoint callback " + str(i) + " is kind "
+        + str(i64(packed[base])) + " and this run has kind " + str(cbs[i].kind)
+    }
+    cbs[i].wait = i64(packed[base + 1])
+    cbs[i].best = packed[base + 2]
+    cbs[i].best_epoch = i64(packed[base + 3])
+    cbs[i].seen = packed[base + 4] > 0.5
+    i = i + 1
+  }
+  ""
+}

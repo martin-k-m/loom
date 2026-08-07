@@ -1,0 +1,162 @@
+mode systems
+
+# state.tw: the values a training run is made of.
+#
+# Everything a callback is allowed to see lives in State, and everything a run
+# needs to be resumed lives in Run. That split is the whole point of this file.
+# A callback that reached into the trainer's locals would be a callback whose
+# effect depends on where in the loop it was called from, and that is the class
+# of bug the documented hook ordering in src/callback.tw exists to prevent.
+
+import "metrics.tw" as met
+
+# Tree is a parameter tree: a tensor, or a list or record nesting tensors. It is
+# what grad differentiates and what std/optim walks with map_leaves. Systems
+# mode has no name for it yet; see docs/needs.md entry 2.
+
+struct Config {
+  epochs: I64,
+  batch_size: I64,
+  # The learning rate the run starts at. A schedule callback rewrites
+  # State.lr; this field keeps the original so a schedule can be expressed
+  # relative to it after a resume.
+  lr: F64,
+  # The one seed. Every stochastic decision in a run derives from it through
+  # src/rng.tw, so there is no second place to look when two runs diverge.
+  seed: I64,
+  shuffle: Bool,
+  # Evaluate after every n-th epoch. 1 evaluates every epoch.
+  eval_every: I64,
+  verbose: Bool,
+}
+
+fn config(epochs: I64, batch_size: I64, lr: F64, seed: I64) -> Config {
+  Config {
+    epochs: epochs,
+    batch_size: batch_size,
+    lr: lr,
+    seed: seed,
+    shuffle: true,
+    eval_every: 1,
+    verbose: true,
+  }
+}
+
+struct State {
+  # Epochs completed. During an epoch this is the index of the epoch running,
+  # and it is incremented after HOOK_EPOCH_END, so a checkpoint written from
+  # that hook records the number of epochs whose updates are in the parameters.
+  # Resuming starts at exactly this value.
+  epoch: I64,
+  epochs: I64,
+  batch: I64,
+  batches: I64,
+  # Training rows in this run's dataset. Recorded so a checkpoint can refuse to
+  # restore into a different dataset.
+  rows: I64,
+  # Optimiser steps taken across the whole run, not reset per epoch. Schedules
+  # that step per update rather than per epoch read this.
+  global_step: I64,
+  lr: F64,
+  # Running means over the epoch so far, weighted by batch size. During an
+  # epoch train_loss is the mean over the batches already seen, not the last
+  # batch's loss.
+  train_loss: F64,
+  val_loss: F64,
+  # The most recent evaluation, keyed by metric name. Empty until the first
+  # HOOK_EVAL_END of the run.
+  val: met.MeterSet,
+  seed: I64,
+  # Set by an early-stopping callback. The trainer reads it after
+  # HOOK_EPOCH_END and stops without starting another epoch.
+  stop: Bool,
+  stop_reason: Str,
+  # Written by a checkpoint callback so a later callback, and the caller, can
+  # name the file that holds the best parameters.
+  best_path: Str,
+}
+
+fn new_state(cfg: Config) -> State {
+  State {
+    epoch: 0,
+    epochs: cfg.epochs,
+    batch: 0,
+    batches: 0,
+    rows: 0,
+    global_step: 0,
+    lr: cfg.lr,
+    train_loss: 0.0,
+    val_loss: 0.0,
+    val: met.new_meters(),
+    seed: cfg.seed,
+    stop: false,
+    stop_reason: "",
+    best_path: "",
+  }
+}
+
+struct OptState {
+  # 0 sgd, 1 momentum, 2 adam. There are no sum types in the subset, so the
+  # discriminant is an I64 and the unused fields are ignored rather than
+  # absent. See docs/needs.md entry 3.
+  kind: I64,
+  # First and second moment trees for adam; `m` alone is the velocity for
+  # momentum. Both are trees shaped like the parameters.
+  m: Tree,
+  v: Tree,
+  # 1-based step count, which is what adam's bias correction needs. It is part
+  # of the checkpoint: restoring parameters without it restarts the correction
+  # and produces a burst of oversized updates on the first resumed batch.
+  t: I64,
+  b1: F64,
+  b2: F64,
+  eps: F64,
+  mu: F64,
+}
+
+let OPT_SGD = 0
+let OPT_MOMENTUM = 1
+let OPT_ADAM = 2
+
+fn sgd(params: Tree) -> OptState {
+  OptState { kind: OPT_SGD, m: params, v: params, t: 0,
+             b1: 0.0, b2: 0.0, eps: 0.0, mu: 0.0 }
+}
+
+fn momentum(params: Tree, mu: F64) -> OptState {
+  OptState { kind: OPT_MOMENTUM, m: zeros_like_tree(params), v: params, t: 0,
+             b1: 0.0, b2: 0.0, eps: 0.0, mu: mu }
+}
+
+fn adam(params: Tree) -> OptState {
+  OptState { kind: OPT_ADAM, m: zeros_like_tree(params), v: zeros_like_tree(params),
+             t: 0, b1: 0.9, b2: 0.999, eps: 0.00000001, mu: 0.0 }
+}
+
+# sgd carries the parameter tree in its unused moment slots rather than a null,
+# because the subset has no null and a tree of the right shape is the cheapest
+# value that will not confuse a checkpoint reader.
+fn zeros_like_tree(params: Tree) -> Tree = map_leaves(fn(p) = p * 0.0, params)
+
+struct Run {
+  params: Tree,
+  opt: OptState,
+  cfg: Config,
+  st: State,
+}
+
+fn new_run(params: Tree, opt: OptState, cfg: Config) -> Run {
+  Run { params: params, opt: opt, cfg: cfg, st: new_state(cfg) }
+}
+
+# What a step returns. Three values, so it is a struct: the subset returns one
+# value per function and multiple returns are docs/needs.md entry 4.
+struct StepResult {
+  # The batch mean loss, already reduced to a scalar. It is an F64 rather than
+  # a rank-0 tensor because it is going into a meter and a comparison, and a
+  # tensor that survives into callback state keeps an autodiff-shaped value
+  # alive for no reason.
+  loss: F64,
+  params: Tree,
+  opt: OptState,
+}

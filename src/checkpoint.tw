@@ -1,0 +1,162 @@
+mode systems
+
+# checkpoint.tw: writing a run down so that resuming it is not a new run.
+#
+# The test this file is written against: train 20 epochs; separately train 10,
+# checkpoint, restore, train 10 more. The two parameter trees must be equal, bit
+# for bit. Anything that fails that test is a checkpoint that loses something,
+# and the usual something is the optimiser.
+#
+# ---- what is captured ------------------------------------------------------
+#
+#   parameters          the whole tree, exactly, via save/load
+#   optimiser state     adam's m and v trees, momentum's velocity, and t.
+#                       t is the reason a parameters-only checkpoint is wrong:
+#                       adam divides by 1 - b1^t, and restarting t at 1 makes
+#                       the bias correction multiply the first resumed update
+#                       by about 10, which is a visible loss spike that gets
+#                       blamed on the data.
+#   epoch               epochs completed, so the resumed run starts at the
+#                       right index and therefore under the right epoch seed
+#   global_step         for schedules that count updates
+#   learning rate       the current one, which a schedule may have moved away
+#                       from cfg.lr
+#   seed                the base seed, so the derived epoch seeds match
+#   callback state      the early-stopping counters and bests, packed by
+#                       src/callback.tw, so a resumed run does not forget that
+#                       it was three epochs into its patience
+#
+# ---- what is not captured --------------------------------------------------
+#
+#   the dataset         a checkpoint records rows-per-epoch, not the rows. Load
+#                       a different dataset and restore succeeds and trains
+#                       something else. rows is stored and compared for exactly
+#                       this reason, and a mismatch is an error rather than a
+#                       warning.
+#   the model's shape   twill's save/load round-trips the tree it was given.
+#                       Restoring a 3-layer checkpoint into a 4-layer model
+#                       fails at the first matmul, not here.
+#   the generator's position within an epoch
+#                       See src/rng.tw. Checkpoints are taken at epoch
+#                       boundaries only, which is what makes the reseeding
+#                       scheme sufficient.
+#   the step function   it is a function value passed by the caller, and a
+#                       function is not serialisable. Resuming with a different
+#                       step function is undetectable from here.
+#   wall clock, host, twill version
+#                       recorded as free-form fields for a human, never
+#                       compared.
+
+import "state.tw" as st
+
+let FORMAT = 1
+
+struct Checkpoint {
+  format: I64,
+  params: Tree,
+  opt_kind: I64,
+  opt_m: Tree,
+  opt_v: Tree,
+  opt_t: I64,
+  opt_b1: F64,
+  opt_b2: F64,
+  opt_eps: F64,
+  opt_mu: F64,
+  epoch: I64,
+  global_step: I64,
+  lr: F64,
+  seed: I64,
+  train_loss: F64,
+  val_loss: F64,
+  rows: I64,
+  batch_size: I64,
+  # Callback state, packed positionally by src/callback.tw. It is stored as a
+  # flat array of numbers rather than a record per callback because the set of
+  # callbacks is not known here, and a checkpoint that only restores when the
+  # callback list is spelled the same way is honest about a real constraint.
+  cb_state: Arr[F64],
+  note: Str,
+}
+
+fn build(r: st.Run, cb_state: Arr[F64], rows: I64, note: Str) -> Checkpoint {
+  Checkpoint {
+    format: FORMAT,
+    params: r.params,
+    opt_kind: r.opt.kind,
+    opt_m: r.opt.m,
+    opt_v: r.opt.v,
+    opt_t: r.opt.t,
+    opt_b1: r.opt.b1,
+    opt_b2: r.opt.b2,
+    opt_eps: r.opt.eps,
+    opt_mu: r.opt.mu,
+    epoch: r.st.epoch,
+    global_step: r.st.global_step,
+    lr: r.st.lr,
+    seed: r.cfg.seed,
+    train_loss: r.st.train_loss,
+    val_loss: r.st.val_loss,
+    rows: rows,
+    batch_size: r.cfg.batch_size,
+    cb_state: cb_state,
+    note: note,
+  }
+}
+
+fn write(r: st.Run, cb_state: Arr[F64], rows: I64, path: Str, note: Str) -> Str {
+  save(build(r, cb_state, rows, note), path)
+  path
+}
+
+fn read(path: Str) -> Checkpoint = load(path)
+
+# Put a checkpoint back into a run. The run must already hold a model of the
+# right shape and a config; restore overwrites the parts a checkpoint owns and
+# leaves the rest, so changing the epoch count or the verbosity between runs
+# works and changing the seed does not silently take effect.
+#
+# Returns an error string, empty on success, following spool's convention: the
+# subset has no Res, so a fallible function that also mutates reports through
+# its return value.
+fn restore(r: st.Run, c: Checkpoint, rows: I64) -> Str {
+  if c.format != FORMAT {
+    return "checkpoint format " + str(c.format) + " is not format " + str(FORMAT)
+  }
+  if c.rows != rows {
+    return "checkpoint was written over " + str(c.rows)
+      + " rows and this dataset has " + str(rows)
+  }
+  if c.opt_kind != r.opt.kind {
+    return "checkpoint holds optimiser state of kind " + str(c.opt_kind)
+      + " and this run uses kind " + str(r.opt.kind)
+  }
+  if c.seed != r.cfg.seed {
+    # The seed is the run. Resuming under a different one produces a different
+    # batch order from the resume point and a result that is neither of the two
+    # runs, so it is refused rather than warned about.
+    return "checkpoint was written under seed " + str(c.seed)
+      + " and this run is seeded " + str(r.cfg.seed)
+  }
+  if c.batch_size != r.cfg.batch_size {
+    # Changing the batch size changes the number of updates per epoch and the
+    # weighting of every metric, so a resume across it is a different run.
+    return "checkpoint used batch size " + str(c.batch_size)
+      + " and this run uses " + str(r.cfg.batch_size)
+  }
+  r.params = c.params
+  r.opt.m = c.opt_m
+  r.opt.v = c.opt_v
+  r.opt.t = c.opt_t
+  r.opt.b1 = c.opt_b1
+  r.opt.b2 = c.opt_b2
+  r.opt.eps = c.opt_eps
+  r.opt.mu = c.opt_mu
+  r.st.epoch = c.epoch
+  r.st.global_step = c.global_step
+  r.st.lr = c.lr
+  r.st.train_loss = c.train_loss
+  r.st.val_loss = c.val_loss
+  r.st.stop = false
+  r.st.stop_reason = ""
+  ""
+}

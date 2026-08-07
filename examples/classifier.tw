@@ -1,0 +1,129 @@
+mode systems
+
+# A three-class MLP trained with loom, end to end.
+#
+# Run it from the project root, because loom's import paths are relative to the
+# working directory and that is twill's rule rather than loom's:
+#
+#   twill run examples/classifier.tw
+#
+# It does not run. See the README.
+
+import "../src/trainer.tw" as tr
+import "../src/state.tw" as st
+import "../src/data.tw" as dt
+import "../src/metrics.tw" as met
+import "../src/callback.tw" as cb
+import "../src/rng.tw" as rng
+
+import "std/nn" as nn
+import "std/data" as sdata
+
+let CLASSES = 3
+let FEATURES = 4
+let HIDDEN = 16
+let SEED = 20260807
+
+# ---- the model ------------------------------------------------------------
+
+# A record rather than a list, so a gradient comes back with field names on it
+# and a shape error names the layer that is wrong.
+fn init_model() -> Tree {
+  # Under a seed derived from the base seed, so changing the epoch count does
+  # not change the starting weights.
+  rng.begin_init(SEED)
+  {
+    w1: nn.he_init(HIDDEN, FEATURES),
+    b1: zeros(HIDDEN),
+    w2: nn.he_init(CLASSES, HIDDEN),
+    b2: zeros(CLASSES),
+  }
+}
+
+fn logits(p: Tree, x: Tensor) -> Tensor {
+  # x is [rows, FEATURES]; both layers are applied row-wise by transposing the
+  # weights rather than looping, which keeps one matmul per layer per batch.
+  let h = relu(x @ transpose(p.w1) + p.b1)
+  h @ transpose(p.w2) + p.b2
+}
+
+fn loss_fn(p: Tree, x: Tensor, y: Tensor) -> Tensor {
+  tr.cross_entropy_batch(logits(p, x), y, CLASSES)
+}
+
+# ---- the step -------------------------------------------------------------
+
+# The whole update, visible. Swap this for one that clips gradients or
+# accumulates over two batches and nothing else in loom changes.
+fn step(p: Tree, opt: st.OptState, x: Tensor, y: Tensor, lr: F64) -> st.StepResult {
+  tr.default_step(p, opt, x, y, lr, loss_fn)
+}
+
+fn eval_batch(p: Tree, x: Tensor, y: Tensor) -> met.MeterSet {
+  let ms = met.new_meters()
+  let out = logits(p, x)
+  let rows = shape(x)[0]
+  # Both are per-row means, so the trainer weights them by `rows` and a short
+  # final batch cannot skew either.
+  met.update_named(ms, "loss", item(tr.cross_entropy_batch(out, y, CLASSES)), rows)
+  met.update_named(ms, "accuracy", met.accuracy(out, y), rows)
+  ms
+}
+
+# ---- the run --------------------------------------------------------------
+
+# Three Gaussian blobs, one per class. Synthetic rather than a checked-in CSV,
+# so the example has no data file to go stale and so the seed is the only thing
+# that decides what it trains on.
+fn make_data(per_class: I64) -> dt.Dataset {
+  seed(rng.derive(SEED, "data"))
+  let centres = [[2.0, 0.0, -1.0, 0.5], [-2.0, 1.0, 0.0, -0.5], [0.0, -2.0, 1.5, 0.0]]
+  let xs: Arr[Tensor] = []
+  let ys: Arr[Tensor] = []
+  let c = 0
+  while c < CLASSES {
+    push(xs, randn(per_class, FEATURES) * 0.8 + centres[c])
+    push(ys, fill(f64(c), per_class))
+    c = c + 1
+  }
+  dt.dataset(concat(xs, 0), concat(ys, 0))
+}
+
+fn main() {
+  let raw = make_data(120)
+  # standardize touches the features only: a standardized class index is not a
+  # class index.
+  let z = sdata.standardize(raw.x)
+
+  let all = dt.dataset(z[0], raw.y)
+  let parts = dt.split(all, 0.8, SEED)
+
+  let params = init_model()
+  let cfg = st.config(60, 16, 0.01, SEED)
+  cfg.eval_every = 1
+  let run = st.new_run(params, st.adam(params), cfg)
+
+  # Ordering is decided by the bands in src/callback.tw, not by this list, so
+  # writing them in a different order here changes nothing.
+  let cbs: Arr[cb.Callback] = [
+    cb.progress(24, 0),
+    cb.metric_log(false),
+    cb.cosine_lr(0.01, 0.0002, 60, 3),
+    cb.early_stopping("accuracy", true, 8, 0.001),
+    cb.checkpointing("runs/blobs.ckpt", 10, true, "accuracy", true),
+  ]
+
+  let err = tr.fit(run, cbs, parts.train, parts.val, step, eval_batch)
+  if len(err) > 0 {
+    print("loom: " + err)
+    exit(1)
+  }
+
+  print("trained " + str(run.st.epoch) + " epochs")
+  print("best parameters are in " + run.st.best_path)
+
+  let pred = tr.predict(run.params, parts.val.x, 64, logits)
+  print("held-out accuracy " + str(met.accuracy(pred, parts.val.y)))
+}
+
+main()

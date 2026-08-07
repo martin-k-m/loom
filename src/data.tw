@@ -1,0 +1,98 @@
+mode systems
+
+# data.tw: a dataset and the batches cut from it.
+#
+# Batching is deliberately thin. It is index arithmetic plus `gather`, which is
+# differentiable, so a batch is a real slice of the same tensor rather than a
+# copy the gradient cannot reach back through. std/data has standardize and
+# train_test_split; this file does not duplicate them and the trainer expects
+# data that has already been through them.
+
+import "rng.tw" as rng
+
+struct Dataset {
+  # [rows, features], or [rows, C, H, W] for images. Only the first axis is
+  # interpreted here.
+  x: Tensor,
+  # [rows] labels or [rows, outputs] targets. Its first axis must match x.
+  y: Tensor,
+  n: I64,
+}
+
+fn dataset(x: Tensor, y: Tensor) -> Dataset {
+  Dataset { x: x, y: y, n: shape(x)[0] }
+}
+
+# An empty dataset, which is how the trainer is told there is no validation set.
+# A row count of zero is checked everywhere it matters rather than a separate
+# has_validation flag, because two ways to say the same thing eventually
+# disagree.
+fn empty() -> Dataset = Dataset { x: zeros(0, 1), y: zeros(0), n: 0 }
+
+# Batches per epoch, counting a short final batch. The alternative, dropping the
+# remainder, throws away up to batch_size - 1 rows every epoch and is a silent
+# change to what the model trained on. loom keeps the short batch and weights it
+# correctly in src/metrics.tw instead.
+fn batch_count(n: I64, batch_size: I64) -> I64 {
+  if batch_size <= 0 {
+    return 0
+  }
+  (n + batch_size - 1) / batch_size
+}
+
+fn batch_end(n: I64, batch_size: I64, b: I64) -> I64 {
+  let hi = (b + 1) * batch_size
+  if hi > n {
+    return n
+  }
+  hi
+}
+
+# The row order for one epoch. `permutation` is seeded, and the trainer has
+# already called rng.begin_epoch, so this ordering is a function of the base
+# seed and the epoch index and of nothing else.
+fn epoch_order(n: I64, shuffle: Bool) -> Tensor {
+  if shuffle {
+    return permutation(n)
+  }
+  tensor(range(n))
+}
+
+# Rows [lo, hi) of the epoch order, as a pair of tensors. Returned as a struct
+# because the subset returns one value per function.
+struct Batch {
+  x: Tensor,
+  y: Tensor,
+  rows: I64,
+}
+
+fn take(d: Dataset, order: Tensor, lo: I64, hi: I64) -> Batch {
+  let idx = order[lo:hi]
+  Batch { x: gather(d.x, idx), y: gather(d.y, idx), rows: hi - lo }
+}
+
+# A deterministic split that does not consume the epoch stream. It reseeds from
+# a tag derived off the base seed, so adding a validation split does not shift
+# the batch orders of a run that previously had none.
+struct Split {
+  train: Dataset,
+  val: Dataset,
+}
+
+fn split(d: Dataset, frac: F64, base_seed: I64) -> Split {
+  seed(rng.derive(base_seed, "split"))
+  let order = permutation(d.n)
+  let cut = i64(f64(d.n) * frac)
+  if cut < 1 {
+    cut = 1
+  }
+  if cut > d.n - 1 {
+    cut = d.n - 1
+  }
+  let tr = order[0:cut]
+  let va = order[cut:d.n]
+  Split {
+    train: dataset(gather(d.x, tr), gather(d.y, tr)),
+    val: dataset(gather(d.x, va), gather(d.y, va)),
+  }
+}

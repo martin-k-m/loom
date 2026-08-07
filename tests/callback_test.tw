@@ -1,0 +1,265 @@
+mode systems
+
+import "harness.tw" as t
+import "../src/callback.tw" as cb
+import "../src/state.tw" as st
+import "../src/metrics.tw" as met
+
+fn a_run(epochs: I64, lr: F64) -> st.Run {
+  let cfg = st.config(epochs, 4, lr, 7)
+  st.Run { params: 0.0, opt: st.sgd(0.0), cfg: cfg, st: st.new_state(cfg) }
+}
+
+fn record_val(r: st.Run, name: Str, v: F64) {
+  r.st.val = met.new_meters()
+  met.update_named(r.st.val, name, v, 1)
+}
+
+# ---- ordering -------------------------------------------------------------
+
+fn callbacks_run_by_band_and_not_by_the_order_they_were_listed() {
+  let cbs: Arr[cb.Callback] = [
+    cb.progress(10, 0),
+    cb.metric_log(false),
+    cb.step_lr(0.1, 0.5, 2),
+    cb.checkpointing("run.ckpt", 1, false, "loss", false),
+    cb.early_stopping("loss", false, 2, 0.0),
+  ]
+  let o = cb.ordered(cbs)
+  t.equal_str("the schedule runs first", o[0].name, "step_lr")
+  t.equal_str("early stopping runs second", o[1].name, "early_stopping")
+  t.equal_str("the checkpoint runs third", o[2].name, "checkpoint")
+  t.equal_str("logging runs fourth", o[3].name, "metric_log")
+  t.equal_str("progress runs last", o[4].name, "progress")
+}
+
+fn callbacks_in_the_same_band_keep_the_callers_order() {
+  let a = cb.metric_log(false)
+  a.name = "first"
+  let b = cb.metric_log(true)
+  b.name = "second"
+  let o = cb.ordered([a, b])
+  t.equal_str("equal bands are stable, first", o[0].name, "first")
+  t.equal_str("equal bands are stable, second", o[1].name, "second")
+}
+
+fn end_hooks_are_the_reverse_of_begin_hooks() {
+  t.check("run begin is a begin hook", not cb.is_end_hook(cb.HOOK_RUN_BEGIN))
+  t.check("epoch begin is a begin hook", not cb.is_end_hook(cb.HOOK_EPOCH_BEGIN))
+  t.check("batch begin is a begin hook", not cb.is_end_hook(cb.HOOK_BATCH_BEGIN))
+  t.check("batch end is an end hook", cb.is_end_hook(cb.HOOK_BATCH_END))
+  t.check("eval end is an end hook", cb.is_end_hook(cb.HOOK_EVAL_END))
+  t.check("epoch end is an end hook", cb.is_end_hook(cb.HOOK_EPOCH_END))
+  t.check("run end is an end hook", cb.is_end_hook(cb.HOOK_RUN_END))
+}
+
+fn two_writers_of_the_same_state_field_are_refused() {
+  let two_schedules: Arr[cb.Callback] = [cb.step_lr(0.1, 0.5, 2), cb.exp_lr(0.1, 0.9)]
+  t.check("two schedules are rejected", len(cb.validate(two_schedules)) > 0)
+  let two_stoppers: Arr[cb.Callback] = [
+    cb.early_stopping("loss", false, 2, 0.0),
+    cb.early_stopping("accuracy", true, 2, 0.0),
+  ]
+  t.check("two early stoppers are rejected", len(cb.validate(two_stoppers)) > 0)
+  let ok: Arr[cb.Callback] = [cb.step_lr(0.1, 0.5, 2), cb.early_stopping("loss", false, 2, 0.0)]
+  t.equal_str("one of each is accepted", cb.validate(ok), "")
+}
+
+fn a_band_outside_the_documented_range_is_refused() {
+  let c = cb.metric_log(false)
+  c.order = 99
+  t.check("an out-of-band callback is rejected", len(cb.validate([c])) > 0)
+}
+
+# ---- improvement tracking -------------------------------------------------
+
+fn a_metric_that_moves_less_than_min_delta_is_not_an_improvement() {
+  let c = cb.early_stopping("loss", false, 2, 0.01)
+  let r = a_run(10, 0.1)
+  record_val(r, "loss", 1.0)
+  cb.observe(c, r)
+  t.check("the first observation is an improvement", c.improved)
+  record_val(r, "loss", 0.995)
+  cb.observe(c, r)
+  t.check("a move of 0.005 under a delta of 0.01 is not an improvement", not c.improved)
+  t.equal_i64("the wait advanced", c.wait, 1)
+  record_val(r, "loss", 0.98)
+  cb.observe(c, r)
+  t.check("a move of 0.02 is an improvement", c.improved)
+  t.equal_i64("the wait reset", c.wait, 0)
+}
+
+fn a_higher_is_better_metric_improves_upward() {
+  let c = cb.early_stopping("accuracy", true, 2, 0.0)
+  let r = a_run(10, 0.1)
+  record_val(r, "accuracy", 0.80)
+  cb.observe(c, r)
+  record_val(r, "accuracy", 0.85)
+  cb.observe(c, r)
+  t.check("a rise improves an upward metric", c.improved)
+  record_val(r, "accuracy", 0.84)
+  cb.observe(c, r)
+  t.check("a fall does not", not c.improved)
+  t.near("the best is kept", c.best, 0.85, 0.000000001)
+}
+
+fn a_monitor_naming_a_metric_that_was_never_recorded_does_nothing() {
+  let c = cb.early_stopping("f1", true, 1, 0.0)
+  let r = a_run(10, 0.1)
+  record_val(r, "loss", 0.5)
+  cb.observe(c, r)
+  t.check("an absent monitor is not an improvement", not c.improved)
+  t.check("an absent monitor leaves the callback unseen", not c.seen)
+  t.equal_i64("an absent monitor does not advance the wait", c.wait, 0)
+}
+
+fn early_stopping_fires_after_patience_is_exceeded_and_not_before() {
+  let c = cb.early_stopping("loss", false, 2, 0.0)
+  let r = a_run(10, 0.1)
+  record_val(r, "loss", 1.0)
+  cb.fire([c], 0, r, cb.HOOK_EVAL_END)
+  t.check("the first evaluation does not stop the run", not r.st.stop)
+  record_val(r, "loss", 1.0)
+  cb.fire([c], 0, r, cb.HOOK_EVAL_END)
+  record_val(r, "loss", 1.0)
+  cb.fire([c], 0, r, cb.HOOK_EVAL_END)
+  t.check("a wait equal to the patience does not stop the run", not r.st.stop)
+  record_val(r, "loss", 1.0)
+  cb.fire([c], 0, r, cb.HOOK_EVAL_END)
+  t.check("a wait past the patience stops the run", r.st.stop)
+  t.check("the stop names the monitor", len(r.st.stop_reason) > 0)
+}
+
+fn early_stopping_ignores_every_hook_but_eval_end() {
+  let c = cb.early_stopping("loss", false, 0, 0.0)
+  let r = a_run(10, 0.1)
+  record_val(r, "loss", 1.0)
+  cb.fire([c], 0, r, cb.HOOK_EPOCH_END)
+  cb.fire([c], 0, r, cb.HOOK_BATCH_END)
+  t.check("no other hook advances early stopping", not c.seen)
+}
+
+# ---- schedules ------------------------------------------------------------
+
+fn a_step_schedule_multiplies_at_each_boundary() {
+  let c = cb.step_lr(0.1, 0.5, 2)
+  t.near("epoch 0", cb.lr_at(c, 0), 0.1, 0.000000001)
+  t.near("epoch 1", cb.lr_at(c, 1), 0.1, 0.000000001)
+  t.near("epoch 2", cb.lr_at(c, 2), 0.05, 0.000000001)
+  t.near("epoch 5", cb.lr_at(c, 5), 0.025, 0.000000001)
+  t.near("epoch 6", cb.lr_at(c, 6), 0.0125, 0.000000001)
+}
+
+fn an_exponential_schedule_decays_every_epoch() {
+  let c = cb.exp_lr(1.0, 0.5)
+  t.near("epoch 0", cb.lr_at(c, 0), 1.0, 0.000000001)
+  t.near("epoch 3", cb.lr_at(c, 3), 0.125, 0.000000001)
+}
+
+fn a_cosine_schedule_starts_at_base_and_ends_at_min() {
+  let c = cb.cosine_lr(0.1, 0.001, 10, 0)
+  t.near("cosine starts at base", cb.lr_at(c, 0), 0.1, 0.000001)
+  t.near("cosine ends at min", cb.lr_at(c, 10), 0.001, 0.000001)
+  t.near("cosine halves at the midpoint", cb.lr_at(c, 5), 0.0505, 0.000001)
+  t.near("cosine holds at min past the horizon", cb.lr_at(c, 40), 0.001, 0.000001)
+}
+
+fn a_warmup_ramps_from_near_zero_and_hands_over_at_base() {
+  let c = cb.cosine_lr(0.1, 0.0, 10, 3)
+  t.near("warmup epoch 0", cb.lr_at(c, 0), 0.025, 0.000001)
+  t.near("warmup epoch 2", cb.lr_at(c, 2), 0.075, 0.000001)
+  t.near("the first post-warmup epoch is base", cb.lr_at(c, 3), 0.1, 0.000001)
+}
+
+fn a_schedule_is_a_function_of_the_epoch_and_nothing_else() {
+  # This is what makes a resumed run take the same rates as an uninterrupted
+  # one. Calling lr_at out of order must not change any answer.
+  let c = cb.cosine_lr(0.1, 0.0, 20, 2)
+  let straight = cb.lr_at(c, 13)
+  cb.lr_at(c, 19)
+  cb.lr_at(c, 0)
+  cb.lr_at(c, 7)
+  t.near("epoch 13 is the same rate however it was reached",
+    cb.lr_at(c, 13), straight, 0.0)
+}
+
+fn a_plateau_schedule_cuts_only_after_patience() {
+  let c = cb.plateau_lr("loss", false, 0.5, 1, 0.001)
+  let r = a_run(10, 0.1)
+  cb.fire_schedule(c, r, cb.HOOK_RUN_BEGIN)
+  t.near("the plateau schedule starts at the config rate", r.st.lr, 0.1, 0.000000001)
+  record_val(r, "loss", 1.0)
+  cb.fire_schedule(c, r, cb.HOOK_EVAL_END)
+  record_val(r, "loss", 1.0)
+  cb.fire_schedule(c, r, cb.HOOK_EVAL_END)
+  t.near("one stalled evaluation is within patience", c.base_lr, 0.1, 0.000000001)
+  record_val(r, "loss", 1.0)
+  cb.fire_schedule(c, r, cb.HOOK_EVAL_END)
+  t.near("two stalled evaluations cut the rate", c.base_lr, 0.05, 0.000000001)
+}
+
+fn a_plateau_schedule_never_goes_below_its_floor() {
+  let c = cb.plateau_lr("loss", false, 0.1, 0, 0.01)
+  let r = a_run(10, 0.1)
+  cb.fire_schedule(c, r, cb.HOOK_RUN_BEGIN)
+  record_val(r, "loss", 1.0)
+  cb.fire_schedule(c, r, cb.HOOK_EVAL_END)
+  record_val(r, "loss", 1.0)
+  cb.fire_schedule(c, r, cb.HOOK_EVAL_END)
+  record_val(r, "loss", 1.0)
+  cb.fire_schedule(c, r, cb.HOOK_EVAL_END)
+  t.near("the floor holds", c.base_lr, 0.01, 0.000000001)
+}
+
+# ---- packed state ---------------------------------------------------------
+
+fn callback_state_round_trips_through_a_pack() {
+  let cbs: Arr[cb.Callback] = [
+    cb.early_stopping("loss", false, 3, 0.0),
+    cb.plateau_lr("loss", false, 0.5, 2, 0.0),
+  ]
+  cbs[0].wait = 2
+  cbs[0].best = 0.375
+  cbs[0].best_epoch = 4
+  cbs[0].seen = true
+  let packed = cb.pack_state(cbs)
+  let fresh: Arr[cb.Callback] = [
+    cb.early_stopping("loss", false, 3, 0.0),
+    cb.plateau_lr("loss", false, 0.5, 2, 0.0),
+  ]
+  t.equal_str("unpacking a matching list succeeds", cb.unpack_state(fresh, packed), "")
+  t.equal_i64("the wait survived", fresh[0].wait, 2)
+  t.near("the best survived", fresh[0].best, 0.375, 0.0)
+  t.equal_i64("the best epoch survived", fresh[0].best_epoch, 4)
+  t.check("the seen flag survived", fresh[0].seen)
+}
+
+fn unpacking_into_a_different_callback_list_is_refused() {
+  let two: Arr[cb.Callback] = [cb.early_stopping("loss", false, 3, 0.0), cb.metric_log(false)]
+  let packed = cb.pack_state(two)
+  let one: Arr[cb.Callback] = [cb.early_stopping("loss", false, 3, 0.0)]
+  t.check("a shorter list is refused", len(cb.unpack_state(one, packed)) > 0)
+  let swapped: Arr[cb.Callback] = [cb.metric_log(false), cb.early_stopping("loss", false, 3, 0.0)]
+  t.check("a reordered list is refused", len(cb.unpack_state(swapped, packed)) > 0)
+}
+
+callbacks_run_by_band_and_not_by_the_order_they_were_listed()
+callbacks_in_the_same_band_keep_the_callers_order()
+end_hooks_are_the_reverse_of_begin_hooks()
+two_writers_of_the_same_state_field_are_refused()
+a_band_outside_the_documented_range_is_refused()
+a_metric_that_moves_less_than_min_delta_is_not_an_improvement()
+a_higher_is_better_metric_improves_upward()
+a_monitor_naming_a_metric_that_was_never_recorded_does_nothing()
+early_stopping_fires_after_patience_is_exceeded_and_not_before()
+early_stopping_ignores_every_hook_but_eval_end()
+a_step_schedule_multiplies_at_each_boundary()
+an_exponential_schedule_decays_every_epoch()
+a_cosine_schedule_starts_at_base_and_ends_at_min()
+a_warmup_ramps_from_near_zero_and_hands_over_at_base()
+a_schedule_is_a_function_of_the_epoch_and_nothing_else()
+a_plateau_schedule_cuts_only_after_patience()
+a_plateau_schedule_never_goes_below_its_floor()
+callback_state_round_trips_through_a_pack()
+unpacking_into_a_different_callback_list_is_refused()
+t.report("callback")

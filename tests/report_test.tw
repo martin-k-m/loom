@@ -1,0 +1,51 @@
+mode systems
+
+import "harness.tw" as t
+import "../src/report.tw" as rep
+
+fn a_fixed_decimal_keeps_its_width() {
+  t.equal_str("a whole number", rep.fixed(1.0, 4), "1.0000")
+  t.equal_str("a fraction", rep.fixed(0.5, 4), "0.5000")
+  t.equal_str("a small fraction", rep.fixed(0.0001, 4), "0.0001")
+  t.equal_str("zero", rep.fixed(0.0, 4), "0.0000")
+}
+
+fn a_fixed_decimal_rounds_rather_than_truncates() {
+  t.equal_str("rounds up", rep.fixed(0.12346, 4), "0.1235")
+  t.equal_str("rounds down", rep.fixed(0.12344, 4), "0.1234")
+}
+
+fn a_carry_out_of_the_fraction_reaches_the_integer_part() {
+  # Without the carry, this prints 0.1000, which reads as ten times too small.
+  t.equal_str("0.9999 to three places", rep.fixed(0.9999, 3), "1.000")
+  t.equal_str("1.9996 to three places", rep.fixed(1.9996, 3), "2.000")
+}
+
+fn a_negative_keeps_its_sign_and_its_magnitude() {
+  t.equal_str("a negative loss", rep.fixed(-0.25, 4), "-0.2500")
+  t.equal_str("a negative carry", rep.fixed(-0.9999, 3), "-1.000")
+}
+
+fn an_epoch_label_does_not_shift_when_the_count_crosses_a_decade() {
+  t.equal_str("single digit in a hundred", rep.epoch_label(7, 100), "epoch   7/100")
+  t.equal_str("triple digit in a hundred", rep.epoch_label(100, 100), "epoch 100/100")
+}
+
+fn a_bar_fills_in_proportion() {
+  t.equal_str("empty", rep.bar(0, 10, 10), "[..........]")
+  t.equal_str("half", rep.bar(5, 10, 10), "[#####.....]")
+  t.equal_str("full", rep.bar(10, 10, 10), "[##########]")
+}
+
+fn a_bar_with_no_total_is_blank_rather_than_full() {
+  t.equal_str("no total", rep.bar(3, 0, 4), "[    ]")
+}
+
+a_fixed_decimal_keeps_its_width()
+a_fixed_decimal_rounds_rather_than_truncates()
+a_carry_out_of_the_fraction_reaches_the_integer_part()
+a_negative_keeps_its_sign_and_its_magnitude()
+an_epoch_label_does_not_shift_when_the_count_crosses_a_decade()
+a_bar_fills_in_proportion()
+a_bar_with_no_total_is_blank_rather_than_full()
+t.report("report")

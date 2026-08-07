@@ -1,0 +1,108 @@
+mode systems
+
+import "harness.tw" as t
+import "../src/metrics.tw" as met
+
+# The test this file exists for. Three batches of 4 and one of 2, and the short
+# batch has a very different value from the rest. The unweighted mean of the
+# per-batch means is 2.5; the correct row-weighted mean is 32/14, about 2.286.
+# A meter that reports 2.5 has the classic bug.
+fn a_short_final_batch_does_not_get_a_full_batch_of_influence() {
+  let m = met.new_meter()
+  met.update(m, 2.0, 4)
+  met.update(m, 2.0, 4)
+  met.update(m, 2.0, 4)
+  met.update(m, 4.0, 2)
+  t.near("weighted mean over 4,4,4,2 rows", met.value(m), 2.2857142857142856, 0.000000001)
+  t.equal_i64("the meter counted every row", met.count(m), 14)
+}
+
+fn equal_batches_agree_with_the_plain_mean() {
+  let m = met.new_meter()
+  met.update(m, 1.0, 8)
+  met.update(m, 3.0, 8)
+  t.near("equal batches average plainly", met.value(m), 2.0, 0.000000001)
+}
+
+fn an_empty_meter_reports_zero_rather_than_a_nan() {
+  let m = met.new_meter()
+  t.near("empty meter is zero", met.value(m), 0.0, 0.0)
+  t.equal_i64("empty meter counted nothing", met.count(m), 0)
+}
+
+fn a_summed_metric_can_be_added_without_being_meaned_first() {
+  let m = met.new_meter()
+  met.add_total(m, 6.0, 4)
+  met.add_total(m, 2.0, 2)
+  t.near("totals divide by the row count", met.value(m), 1.3333333333333333, 0.000000001)
+}
+
+fn reset_clears_both_halves_of_a_meter() {
+  let m = met.new_meter()
+  met.update(m, 5.0, 10)
+  met.reset(m)
+  t.near("reset zeroes the value", met.value(m), 0.0, 0.0)
+  t.equal_i64("reset zeroes the weight", met.count(m), 0)
+}
+
+fn a_meter_set_keeps_names_in_first_seen_order() {
+  let ms = met.new_meters()
+  met.update_named(ms, "loss", 1.0, 4)
+  met.update_named(ms, "accuracy", 0.5, 4)
+  met.update_named(ms, "loss", 3.0, 4)
+  t.equal_i64("two names were recorded", len(ms.names), 2)
+  t.equal_str("loss was seen first", ms.names[0], "loss")
+  t.equal_str("accuracy was seen second", ms.names[1], "accuracy")
+  t.near("loss is the mean of its two batches", met.value_named(ms, "loss"), 2.0, 0.000000001)
+}
+
+fn a_meter_set_weights_each_name_by_its_own_rows() {
+  let ms = met.new_meters()
+  met.update_named(ms, "loss", 1.0, 100)
+  met.update_named(ms, "loss", 9.0, 1)
+  t.near("one row cannot outweigh a hundred",
+    met.value_named(ms, "loss"), 1.0792079207920793, 0.000000001)
+}
+
+fn an_unseen_name_reads_as_absent_rather_than_zero() {
+  let ms = met.new_meters()
+  met.update_named(ms, "loss", 1.0, 1)
+  t.check("loss is present", met.has(ms, "loss"))
+  t.check("accuracy is absent", not met.has(ms, "accuracy"))
+}
+
+fn a_counter_divides_once_at_the_end() {
+  # Precision over two batches: 1 of 2 correct, then 3 of 3. Meaning the mean
+  # of 0.5 and 1.0 is 0.75, and the correct pooled value is 4/5 = 0.8.
+  let c = met.new_counter()
+  met.count_up(c, 1.0, 2.0)
+  met.count_up(c, 3.0, 3.0)
+  t.near("a ratio metric pools its counts", met.ratio(c), 0.8, 0.000000001)
+}
+
+fn an_empty_counter_reports_zero() {
+  t.near("empty counter is zero", met.ratio(met.new_counter()), 0.0, 0.0)
+}
+
+fn update_batch_applies_one_row_count_to_every_name() {
+  let ms = met.new_meters()
+  let names: Arr[Str] = ["loss", "accuracy"]
+  let values: Arr[F64] = [2.0, 0.5]
+  met.update_batch(ms, names, values, 8)
+  met.update_batch(ms, names, [4.0, 1.0], 8)
+  t.near("batched loss", met.value_named(ms, "loss"), 3.0, 0.000000001)
+  t.near("batched accuracy", met.value_named(ms, "accuracy"), 0.75, 0.000000001)
+}
+
+a_short_final_batch_does_not_get_a_full_batch_of_influence()
+equal_batches_agree_with_the_plain_mean()
+an_empty_meter_reports_zero_rather_than_a_nan()
+a_summed_metric_can_be_added_without_being_meaned_first()
+reset_clears_both_halves_of_a_meter()
+a_meter_set_keeps_names_in_first_seen_order()
+a_meter_set_weights_each_name_by_its_own_rows()
+an_unseen_name_reads_as_absent_rather_than_zero()
+a_counter_divides_once_at_the_end()
+an_empty_counter_reports_zero()
+update_batch_applies_one_row_count_to_every_name()
+t.report("metrics")

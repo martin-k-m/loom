@@ -1,0 +1,76 @@
+mode systems
+
+# rng.tw: one seed, threaded, with no hidden global state.
+#
+# twill's randomness is seeded and deterministic by default, so a program
+# reproduces. That is not the same as a *resumable* run reproducing. The
+# generator has a position as well as a seed, and a run stopped after epoch 7
+# and restarted has a generator sitting at position zero while the uninterrupted
+# run's generator is wherever 7 epochs of shuffling left it. The two runs then
+# see different batch orders and different dropout masks from epoch 8 onward,
+# and every parameter after that differs.
+#
+# The fix here does not need the generator's position to be readable, which is
+# just as well because it is not (docs/needs.md entry 6). Instead the run
+# reseeds at the start of every epoch from a value derived from the base seed
+# and the epoch index. Epoch 8 draws the same numbers whether it is the eighth
+# epoch of one run or the first epoch after a resume, because its seed is a
+# function of 8 and nothing else.
+#
+# The cost is that within an epoch the stream is still positional, so a run
+# resumed mid-epoch is not exact. loom checkpoints on epoch boundaries only,
+# and that is why.
+
+# A 64-bit mix. Consecutive epoch indices differ in one low bit, and feeding
+# base + epoch to a generator directly would give epoch 8 and epoch 9 highly
+# correlated streams. The multiply-xorshift-multiply here is splitmix64's
+# finaliser, which decorrelates them.
+let MIX_A = 6364136223846793005
+let MIX_B = -4658895280553007687
+let MIX_C = -7723592293110705685
+
+fn mix(x: I64) -> I64 {
+  let z = x
+  z = xor(z, shr(z, 30))
+  z = z * MIX_B
+  z = xor(z, shr(z, 27))
+  z = z * MIX_C
+  z = xor(z, shr(z, 31))
+  z
+}
+
+# The seed epoch `epoch` runs under. Deterministic in (base, epoch) alone, so
+# it survives a resume and does not depend on how the run got here.
+fn epoch_seed(base: I64, epoch: I64) -> I64 {
+  let s = mix(base + MIX_A * (epoch + 1))
+  # seed() takes a non-negative value, and the mix produces the full signed
+  # range. Masking off the sign bit is a bijection on the low 63 bits, so it
+  # does not collapse two epochs onto one seed.
+  and(s, 9223372036854775807)
+}
+
+# Called by the trainer at the top of each epoch, before any shuffling.
+fn begin_epoch(base: I64, epoch: I64) {
+  seed(epoch_seed(base, epoch))
+}
+
+# A seed for a purpose that is not an epoch: a train/test split, an
+# initialisation, a data augmentation stream. `tag` separates them, so a split
+# and an init derived from the same base seed do not draw the same numbers.
+fn derive(base: I64, tag: Str) -> I64 {
+  let h = 1469598103934665603
+  let i = 0
+  while i < len(tag) {
+    h = xor(h, tag[i])
+    h = h * 1099511628211
+    i = i + 1
+  }
+  and(mix(base + h), 9223372036854775807)
+}
+
+# Initialise a model's parameters under a derived seed rather than the ambient
+# one, so that changing the number of epochs does not change the starting
+# weights.
+fn begin_init(base: I64) {
+  seed(derive(base, "init"))
+}

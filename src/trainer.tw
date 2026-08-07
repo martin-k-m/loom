@@ -1,0 +1,248 @@
+mode systems
+
+# trainer.tw: fit, evaluate, predict.
+#
+# The loop is written out. There is no hidden work: every gradient, every
+# parameter update and every metric happens in a function this file calls or in
+# the step function the caller passed in. A framework whose training loop is a
+# single opaque call is a framework you cannot debug, and the whole reason to
+# hand loom a step function rather than a "compile" call is that the update rule
+# stays visible and replaceable.
+#
+# The step function's contract:
+#
+#   fn step(params: Tree, opt: st.OptState, x: Tensor, y: Tensor, lr: F64)
+#     -> st.StepResult
+#
+# It computes the loss over the batch, differentiates it, applies one optimiser
+# update, and returns the new parameters, the new optimiser state, and the batch
+# mean loss. It must not touch Run or State: everything it needs is an argument,
+# so the same step function works under fit, under a manual loop, and in a test.
+# `default_step` below is a working one for the common case.
+#
+# The evaluation function's contract:
+#
+#   fn eval_batch(params: Tree, x: Tensor, y: Tensor) -> met.MeterSet
+#
+# It returns a set of per-batch means, which evaluate accumulates with the batch
+# size as the weight. Returning means rather than sums is what lets the same
+# function serve a batch and a whole dataset.
+
+import "state.tw" as st
+import "data.tw" as dt
+import "metrics.tw" as met
+import "rng.tw" as rng
+import "callback.tw" as cb
+import "checkpoint.tw" as ckpt
+
+import "std/nn" as nn
+import "std/optim" as optim
+
+# ---- the loop -------------------------------------------------------------
+
+# Trains until the epoch budget is spent or a callback sets State.stop.
+# Mutates and returns `r`, so a caller can fit, inspect and fit again, and so a
+# restored run continues from where the checkpoint left it rather than from
+# epoch zero.
+#
+# Returns an error string in the second position by writing it into the run's
+# stop_reason and returning it; the subset has no Res.
+fn fit(r: st.Run, cbs_in: Arr[cb.Callback], train: dt.Dataset, val: dt.Dataset,
+       step: fn(Tree, st.OptState, Tensor, Tensor, F64) -> st.StepResult,
+       eval_batch: fn(Tree, Tensor, Tensor) -> met.MeterSet) -> Str {
+  let bad = cb.validate(cbs_in)
+  if len(bad) > 0 {
+    return bad
+  }
+  if r.cfg.batch_size <= 0 {
+    return "batch_size must be positive"
+  }
+  if train.n == 0 {
+    return "the training set is empty"
+  }
+  # Ordered once, here, and used for every hook. Re-sorting per hook would let
+  # a callback that mutated its own order change the sequence mid-run.
+  let cbs = cb.ordered(cbs_in)
+  r.st.epochs = r.cfg.epochs
+  r.st.rows = train.n
+  r.st.batches = dt.batch_count(train.n, r.cfg.batch_size)
+
+  cb.dispatch(cbs, r, cb.HOOK_RUN_BEGIN)
+
+  # Starts at r.st.epoch rather than 0, which is what makes a restored run
+  # continue instead of retrain.
+  while r.st.epoch < r.cfg.epochs and not r.st.stop {
+    # Before anything stochastic. The epoch's shuffle, and any randomness the
+    # step function draws, both come from this one call.
+    rng.begin_epoch(r.cfg.seed, r.st.epoch)
+    let order = dt.epoch_order(train.n, r.cfg.shuffle)
+    let loss = met.new_meter()
+    r.st.batch = 0
+
+    cb.dispatch(cbs, r, cb.HOOK_EPOCH_BEGIN)
+
+    let b = 0
+    while b < r.st.batches {
+      r.st.batch = b
+      let lo = b * r.cfg.batch_size
+      let hi = dt.batch_end(train.n, r.cfg.batch_size, b)
+      let batch = dt.take(train, order, lo, hi)
+
+      cb.dispatch(cbs, r, cb.HOOK_BATCH_BEGIN)
+
+      let res = step(r.params, r.opt, batch.x, batch.y, r.st.lr)
+      r.params = res.params
+      r.opt = res.opt
+      # Weighted by the batch's row count, not by 1. See src/metrics.tw.
+      met.update(loss, res.loss, batch.rows)
+      r.st.train_loss = met.value(loss)
+      r.st.global_step = r.st.global_step + 1
+
+      cb.dispatch(cbs, r, cb.HOOK_BATCH_END)
+      b = b + 1
+    }
+
+    r.st.train_loss = met.value(loss)
+    # Incremented before the end hooks, so State.epoch counts epochs whose
+    # updates are in the parameters. A checkpoint written from HOOK_EPOCH_END
+    # therefore records a number the resume can start from directly.
+    r.st.epoch = r.st.epoch + 1
+
+    if val.n > 0 and r.cfg.eval_every > 0 and r.st.epoch % r.cfg.eval_every == 0 {
+      r.st.val = evaluate(r.params, val, r.cfg.batch_size, eval_batch)
+      r.st.val_loss = met.value_named(r.st.val, "loss")
+      cb.dispatch(cbs, r, cb.HOOK_EVAL_END)
+    }
+
+    cb.dispatch(cbs, r, cb.HOOK_EPOCH_END)
+  }
+
+  cb.dispatch(cbs, r, cb.HOOK_RUN_END)
+  ""
+}
+
+# ---- evaluation -----------------------------------------------------------
+
+# No shuffling and no seeding: evaluation draws no random numbers, and calling
+# seed() here would move the generator and change the training that follows.
+fn evaluate(params: Tree, d: dt.Dataset, batch_size: I64,
+            eval_batch: fn(Tree, Tensor, Tensor) -> met.MeterSet) -> met.MeterSet {
+  let out = met.new_meters()
+  if d.n == 0 {
+    return out
+  }
+  let order = dt.epoch_order(d.n, false)
+  let nb = dt.batch_count(d.n, batch_size)
+  let b = 0
+  while b < nb {
+    let lo = b * batch_size
+    let hi = dt.batch_end(d.n, batch_size, b)
+    let batch = dt.take(d, order, lo, hi)
+    let got = eval_batch(params, batch.x, batch.y)
+    let i = 0
+    while i < len(got.names) {
+      let name = got.names[i]
+      met.update_named(out, name, met.value_named(got, name), batch.rows)
+      i = i + 1
+    }
+    b = b + 1
+  }
+  out
+}
+
+# ---- prediction -----------------------------------------------------------
+
+# Batched so a dataset larger than memory does not have to be one forward pass,
+# and concatenated in input order, so row i of the result corresponds to row i
+# of the input. Nothing is shuffled here for that reason.
+fn predict(params: Tree, x: Tensor, batch_size: I64,
+           forward: fn(Tree, Tensor) -> Tensor) -> Tensor {
+  let n = shape(x)[0]
+  let nb = dt.batch_count(n, batch_size)
+  let parts: Arr[Tensor] = []
+  let b = 0
+  while b < nb {
+    let lo = b * batch_size
+    let hi = dt.batch_end(n, batch_size, b)
+    push(parts, forward(params, x[lo:hi]))
+    b = b + 1
+  }
+  concat(parts, 0)
+}
+
+# ---- a default step -------------------------------------------------------
+
+# One optimiser update over one batch, for a model whose loss is a function of
+# (params, x, y). It is a plain function rather than a method, so replacing it
+# means writing another function with the same shape and passing that instead.
+#
+# `loss_fn` returns a rank-0 tensor. value_and_grad gives the loss and the
+# gradient tree in one reverse pass, which is half the work of calling the loss
+# and then grad separately.
+fn default_step(params: Tree, opt: st.OptState, x: Tensor, y: Tensor, lr: F64,
+                loss_fn: fn(Tree, Tensor, Tensor) -> Tensor) -> st.StepResult {
+  let vg = value_and_grad(fn(p) = loss_fn(p, x, y))(params)
+  let loss = item(vg[0])
+  let g = vg[1]
+  apply(params, g, opt, lr, loss)
+}
+
+# The update itself, split out so a caller writing a custom step (gradient
+# clipping, accumulation over several batches, a second loss term) can reuse
+# the optimiser dispatch without reimplementing it.
+fn apply(params: Tree, g: Tree, opt: st.OptState, lr: F64, loss: F64) -> st.StepResult {
+  if opt.kind == st.OPT_SGD {
+    return st.StepResult { loss: loss, params: optim.sgd_step(params, g, lr), opt: opt }
+  }
+  if opt.kind == st.OPT_MOMENTUM {
+    let out = optim.momentum_step(params, g, opt.m, lr, opt.mu)
+    opt.m = out[1]
+    opt.t = opt.t + 1
+    return st.StepResult { loss: loss, params: out[0], opt: opt }
+  }
+  # adam. t is incremented before the step because std/optim expects a 1-based
+  # count: passing 0 makes the bias correction divide by zero.
+  opt.t = opt.t + 1
+  let out = optim.adam_step(params, g, opt.m, opt.v, opt.t, lr, opt.b1, opt.b2, opt.eps)
+  opt.m = out[1]
+  opt.v = out[2]
+  st.StepResult { loss: loss, params: out[0], opt: opt }
+}
+
+# ---- resuming -------------------------------------------------------------
+
+# Read a checkpoint and put it back into a run and its callbacks. Call it before
+# fit; fit then starts at the restored epoch. Returns an error string, empty on
+# success.
+fn resume(r: st.Run, cbs: Arr[cb.Callback], path: Str, rows: I64) -> Str {
+  let c = ckpt.read(path)
+  let bad = ckpt.restore(r, c, rows)
+  if len(bad) > 0 {
+    return bad
+  }
+  if len(c.cb_state) == 0 {
+    # A best-only checkpoint carries no callback state. Restoring parameters
+    # from it is legitimate; resuming training from it is not, and saying so is
+    # better than resetting every patience counter without comment.
+    return ""
+  }
+  cb.unpack_state(cbs, c.cb_state)
+}
+
+# ---- a worked loss --------------------------------------------------------
+
+# Softmax cross-entropy over a batch of logits, meaned over rows. Provided so
+# the examples and tests have a real loss to call and so the shape contract a
+# step function works against is written down somewhere.
+#
+# `logits` is [rows, classes] and `labels` is [rows] of class indices.
+fn cross_entropy_batch(logits: Tensor, labels: Tensor, classes: I64) -> Tensor {
+  let rows = shape(logits)[0]
+  let total = scalar(0.0)
+  let i = 0
+  while i < rows {
+    total = total + nn.cross_entropy(logits[i], nn.onehot(labels[i], classes))
+    i = i + 1
+  }
+  total / f64(rows)
+}

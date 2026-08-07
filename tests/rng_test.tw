@@ -1,0 +1,55 @@
+mode systems
+
+import "harness.tw" as t
+import "../src/rng.tw" as rng
+
+fn an_epoch_seed_depends_only_on_the_base_and_the_epoch() {
+  t.equal_i64("epoch 8 under seed 1 is stable",
+    rng.epoch_seed(1, 8), rng.epoch_seed(1, 8))
+  t.check("epoch 8 and epoch 9 differ", rng.epoch_seed(1, 8) != rng.epoch_seed(1, 9))
+  t.check("two base seeds differ at the same epoch",
+    rng.epoch_seed(1, 8) != rng.epoch_seed(2, 8))
+}
+
+fn an_epoch_seed_is_never_negative() {
+  # seed() takes a non-negative value and the mix spans the signed range, so
+  # this is the property the masking in epoch_seed exists to hold.
+  let e = 0
+  while e < 64 {
+    t.check("epoch seed " + str(e) + " is non-negative", rng.epoch_seed(-7919, e) >= 0)
+    e = e + 1
+  }
+}
+
+fn consecutive_epochs_do_not_produce_adjacent_seeds() {
+  # The failure this guards against is base + epoch fed straight to a
+  # generator, where neighbouring epochs draw correlated streams. A weak but
+  # cheap check: the seeds should differ in their low bits, not only their
+  # high ones.
+  let a = rng.epoch_seed(1000, 3)
+  let b = rng.epoch_seed(1000, 4)
+  let d = a - b
+  if d < 0 {
+    d = -d
+  }
+  t.check("neighbouring epoch seeds are far apart", d > 1000000)
+}
+
+fn a_derived_seed_separates_purposes() {
+  t.check("init and split do not share a stream",
+    rng.derive(5, "init") != rng.derive(5, "split"))
+  t.equal_i64("a derived seed is stable", rng.derive(5, "init"), rng.derive(5, "init"))
+  t.check("a derived seed is non-negative", rng.derive(-1, "augment") >= 0)
+}
+
+fn a_derived_seed_is_not_an_epoch_seed() {
+  t.check("derive and epoch_seed do not collide",
+    rng.derive(9, "init") != rng.epoch_seed(9, 0))
+}
+
+an_epoch_seed_depends_only_on_the_base_and_the_epoch()
+an_epoch_seed_is_never_negative()
+consecutive_epochs_do_not_produce_adjacent_seeds()
+a_derived_seed_separates_purposes()
+a_derived_seed_is_not_an_epoch_seed()
+t.report("rng")

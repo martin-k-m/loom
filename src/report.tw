@@ -1,0 +1,134 @@
+mode systems
+
+# report.tw: the lines a run prints.
+#
+# These are plain, uncoloured, and single-line. twill has a real terminal layer
+# in src/term/ and a progress bar in src/cli/progress.tw, and this file would
+# rather call them than reimplement them. It cannot: those are files inside the
+# twill repository, and twill resolves a non-std import as a path relative to
+# the importing file. Only modules under std/ are reachable from an installed
+# package, and the terminal layer is not one of them. See docs/needs.md entry 8.
+#
+# The consequence, stated so nobody goes looking for it: loom has no progress
+# bar, no colour, and no carriage-return repainting. A progress callback prints
+# one line per epoch. That is worse than the bar twill already has and it is not
+# a design decision.
+
+import "state.tw" as st
+import "metrics.tw" as met
+
+# A fixed-width decimal. `str` on an F64 prints a shortest round-trip form,
+# which is right for a value being read back and wrong for a column of losses,
+# where varying width makes the column unreadable and small changes invisible.
+fn fixed(x: F64, places: I64) -> Str {
+  let neg = x < 0.0
+  let v = x
+  if neg {
+    v = -v
+  }
+  let scale = 1.0
+  let i = 0
+  while i < places {
+    scale = scale * 10.0
+    i = i + 1
+  }
+  let whole = i64(v)
+  let frac = i64((v - f64(whole)) * scale + 0.5)
+  # Rounding the fraction can carry into the integer part. Without this, 0.9996
+  # to three places prints "0.1000".
+  if f64(frac) >= scale {
+    frac = 0
+    whole = whole + 1
+  }
+  let out = str(whole) + "." + pad_left_zero(str(frac), places)
+  if neg {
+    return "-" + out
+  }
+  out
+}
+
+fn pad_left_zero(s: Str, width: I64) -> Str {
+  let out = s
+  while len(out) < width {
+    out = "0" + out
+  }
+  out
+}
+
+fn pad_right(s: Str, width: I64) -> Str {
+  let out = s
+  while len(out) < width {
+    out = out + " "
+  }
+  out
+}
+
+fn pad_left(s: Str, width: I64) -> Str {
+  let out = s
+  while len(out) < width {
+    out = " " + out
+  }
+  out
+}
+
+# "epoch  7/20" with the numbers right-aligned against the total, so the column
+# does not shift when the epoch count crosses a power of ten.
+fn epoch_label(epoch: I64, epochs: I64) -> Str {
+  let total = str(epochs)
+  "epoch " + pad_left(str(epoch), len(total)) + "/" + total
+}
+
+# The per-epoch line. Validation metrics are appended in the order they were
+# first recorded, which src/metrics.tw fixes, so the columns are the same on
+# every line of a run and diffing two runs' logs lines up.
+fn epoch_line(s: st.State) -> Str {
+  let out = epoch_label(s.epoch, s.epochs)
+    + "  loss " + fixed(s.train_loss, 4)
+    + "  lr " + fixed(s.lr, 6)
+  let i = 0
+  while i < len(s.val.names) {
+    let name = s.val.names[i]
+    out = out + "  val_" + name + " " + fixed(met.value_named(s.val, name), 4)
+    i = i + 1
+  }
+  out
+}
+
+# One JSON object per line. Machine-readable output is a separate function
+# rather than a flag on the human one, because a format that is sometimes
+# parseable is a format nothing parses.
+fn epoch_json(s: st.State) -> Str {
+  let out = "{\"epoch\":" + str(s.epoch)
+    + ",\"epochs\":" + str(s.epochs)
+    + ",\"global_step\":" + str(s.global_step)
+    + ",\"lr\":" + str(s.lr)
+    + ",\"train_loss\":" + str(s.train_loss)
+  let i = 0
+  while i < len(s.val.names) {
+    out = out + ",\"val_" + s.val.names[i] + "\":"
+      + str(met.value_named(s.val, s.val.names[i]))
+    i = i + 1
+  }
+  out + "}"
+}
+
+# A textual progress indication, printed once per epoch. It is a fill without a
+# time estimate, and the estimate is the part that would actually help. See the
+# note at the top of this file for why it is not here.
+fn bar(done: I64, total: I64, width: I64) -> Str {
+  if total <= 0 {
+    return "[" + pad_right("", width) + "]"
+  }
+  let filled = done * width / total
+  let out = "["
+  let i = 0
+  while i < width {
+    if i < filled {
+      out = out + "#"
+    } else {
+      out = out + "."
+    }
+    i = i + 1
+  }
+  out + "]"
+}

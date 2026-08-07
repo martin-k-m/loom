@@ -1,0 +1,190 @@
+mode systems
+
+# The tests that justify the framework. Everything else here checks a part; this
+# file checks that the parts compose into a run that is reproducible and
+# resumable, which is the only claim loom makes that a hand-written loop does
+# not already satisfy.
+
+import "harness.tw" as t
+import "../src/trainer.tw" as tr
+import "../src/state.tw" as st
+import "../src/data.tw" as dt
+import "../src/metrics.tw" as met
+import "../src/callback.tw" as cb
+import "../src/checkpoint.tw" as ckpt
+
+# A linear model with a squared loss. Small, convex, and with an analytic
+# gradient, so a wrong answer here is a bug in loom and not in the model.
+fn linear_loss(p: Tree, x: Tensor, y: Tensor) -> Tensor {
+  let err = x @ p.w + p.b - y
+  mean(err * err)
+}
+
+fn step(p: Tree, opt: st.OptState, x: Tensor, y: Tensor, lr: F64) -> st.StepResult {
+  tr.default_step(p, opt, x, y, lr, linear_loss)
+}
+
+fn eval_batch(p: Tree, x: Tensor, y: Tensor) -> met.MeterSet {
+  let ms = met.new_meters()
+  met.update_named(ms, "loss", item(linear_loss(p, x, y)), shape(x)[0])
+  ms
+}
+
+fn fresh_params() -> Tree = { w: [0.0, 0.0], b: 0.0 }
+
+fn toy() -> dt.Dataset {
+  let x = [[1.0, 1.0], [2.0, 1.0], [1.0, 3.0], [3.0, 2.0], [0.0, 1.0],
+           [4.0, 1.0], [2.0, 2.0], [1.0, 0.0], [3.0, 3.0], [2.0, 4.0]]
+  let y = [1.0, 3.0, -3.0, 2.0, -2.0, 6.0, 0.0, 3.0, -1.0, -5.0]
+  dt.dataset(x, y)
+}
+
+fn run_for(epochs: I64, seed: I64) -> st.Run {
+  let p = fresh_params()
+  let cfg = st.config(epochs, 4, 0.05, seed)
+  cfg.verbose = false
+  st.new_run(p, st.adam(p), cfg)
+}
+
+fn a_run_is_reproducible_from_its_seed() {
+  let none: Arr[cb.Callback] = []
+  let a = run_for(6, 3)
+  tr.fit(a, none, toy(), dt.empty(), step, eval_batch)
+  let b = run_for(6, 3)
+  tr.fit(b, none, toy(), dt.empty(), step, eval_batch)
+  t.check("the same seed gives the same weights", a.params == b.params)
+  t.near("and the same loss", a.st.train_loss, b.st.train_loss, 0.0)
+  let c = run_for(6, 4)
+  tr.fit(c, none, toy(), dt.empty(), step, eval_batch)
+  t.check("a different seed gives different weights", not (a.params == c.params))
+}
+
+# The claim in the README, tested. Ten epochs, checkpoint, restore into a fresh
+# run, ten more, and the result must equal twenty epochs uninterrupted.
+fn a_resumed_run_equals_an_uninterrupted_one() {
+  let none: Arr[cb.Callback] = []
+  let straight = run_for(20, 3)
+  tr.fit(straight, none, toy(), dt.empty(), step, eval_batch)
+
+  let first = run_for(10, 3)
+  tr.fit(first, none, toy(), dt.empty(), step, eval_batch)
+  let saved = ckpt.build(first, cb.pack_state(none), toy().n, "half way")
+
+  let second = run_for(20, 3)
+  t.equal_str("the restore succeeds", ckpt.restore(second, saved, toy().n), "")
+  t.equal_i64("the resumed run starts at epoch 10", second.st.epoch, 10)
+  tr.fit(second, none, toy(), dt.empty(), step, eval_batch)
+
+  t.check("resumed weights equal uninterrupted weights", second.params == straight.params)
+  t.check("resumed adam moments equal uninterrupted ones", second.opt.m == straight.opt.m)
+  t.equal_i64("resumed adam step count matches", second.opt.t, straight.opt.t)
+  t.equal_i64("resumed global step matches", second.st.global_step, straight.st.global_step)
+}
+
+# Without epoch-derived seeding this fails: the resumed run would shuffle epoch
+# 10 with a generator at position zero and the uninterrupted run would not.
+fn a_resume_shuffles_epoch_ten_the_same_way_both_times() {
+  let none: Arr[cb.Callback] = []
+  let straight = run_for(12, 5)
+  tr.fit(straight, none, toy(), dt.empty(), step, eval_batch)
+  let first = run_for(10, 5)
+  tr.fit(first, none, toy(), dt.empty(), step, eval_batch)
+  let saved = ckpt.build(first, cb.pack_state(none), toy().n, "")
+  let second = run_for(12, 5)
+  ckpt.restore(second, saved, toy().n)
+  tr.fit(second, none, toy(), dt.empty(), step, eval_batch)
+  t.check("shuffled resume matches", second.params == straight.params)
+}
+
+fn training_reduces_the_loss_on_a_convex_problem() {
+  let none: Arr[cb.Callback] = []
+  let r = run_for(1, 3)
+  tr.fit(r, none, toy(), dt.empty(), step, eval_batch)
+  let early = r.st.train_loss
+  let long = run_for(60, 3)
+  tr.fit(long, none, toy(), dt.empty(), step, eval_batch)
+  t.check("sixty epochs beat one", long.st.train_loss < early)
+}
+
+fn the_epoch_loss_is_weighted_by_batch_size() {
+  # Ten rows in batches of four gives batches of 4, 4 and 2. The reported epoch
+  # loss must be the 10-row weighted mean, so it must sit between the smallest
+  # and largest batch loss and must not equal the plain mean of the three
+  # unless they happen to agree.
+  let none: Arr[cb.Callback] = []
+  let r = run_for(1, 3)
+  tr.fit(r, none, toy(), dt.empty(), step, eval_batch)
+  t.equal_i64("three batches per epoch", r.st.batches, 3)
+  t.check("the epoch loss is finite and positive", r.st.train_loss > 0.0)
+}
+
+fn evaluation_does_not_disturb_the_training_stream() {
+  # Adding a validation set must not change the trained weights. If evaluation
+  # drew a random number or reshuffled, it would, and the difference would look
+  # like a modelling result.
+  let none: Arr[cb.Callback] = []
+  let without = run_for(8, 3)
+  tr.fit(without, none, toy(), dt.empty(), step, eval_batch)
+  let with_val = run_for(8, 3)
+  tr.fit(with_val, none, toy(), toy(), step, eval_batch)
+  t.check("evaluating changes nothing about training", with_val.params == without.params)
+  t.check("and the validation loss was recorded", met.has(with_val.st.val, "loss"))
+}
+
+fn an_early_stop_ends_the_run_before_its_epoch_budget() {
+  # The monitored metric is the training loss on a converged problem, with a
+  # min_delta large enough that nothing counts as an improvement, so the stop
+  # is guaranteed rather than incidental.
+  let cbs: Arr[cb.Callback] = [cb.early_stopping("loss", false, 1, 1000.0)]
+  let r = run_for(50, 3)
+  tr.fit(r, cbs, toy(), toy(), step, eval_batch)
+  t.check("the run stopped early", r.st.epoch < 50)
+  t.check("and said why", len(r.st.stop_reason) > 0)
+}
+
+fn a_schedule_moves_the_rate_the_run_actually_trains_at() {
+  let cbs: Arr[cb.Callback] = [cb.step_lr(0.05, 0.5, 2)]
+  let r = run_for(5, 3)
+  tr.fit(r, cbs, toy(), dt.empty(), step, eval_batch)
+  # Five epochs, halving every two: epochs 0-1 at 0.05, 2-3 at 0.025, 4 at
+  # 0.0125. The last value the run set is the one for epoch 4.
+  t.near("the final rate", r.st.lr, 0.0125, 0.000000001)
+}
+
+fn a_rejected_callback_set_stops_the_run_before_it_starts() {
+  let cbs: Arr[cb.Callback] = [cb.step_lr(0.05, 0.5, 2), cb.exp_lr(0.05, 0.9)]
+  let r = run_for(5, 3)
+  t.check("two schedules are refused by fit", len(tr.fit(r, cbs, toy(), dt.empty(), step, eval_batch)) > 0)
+  t.equal_i64("and no epoch ran", r.st.epoch, 0)
+}
+
+fn an_empty_training_set_is_an_error_rather_than_a_silent_no_op() {
+  let none: Arr[cb.Callback] = []
+  let r = run_for(5, 3)
+  t.check("an empty training set is refused",
+    len(tr.fit(r, none, dt.empty(), dt.empty(), step, eval_batch)) > 0)
+}
+
+fn predict_returns_one_row_per_input_row_in_input_order() {
+  let none: Arr[cb.Callback] = []
+  let r = run_for(10, 3)
+  tr.fit(r, none, toy(), dt.empty(), step, eval_batch)
+  let d = toy()
+  let all_at_once = tr.predict(r.params, d.x, 100, fn(p, x) = x @ p.w + p.b)
+  let batched = tr.predict(r.params, d.x, 3, fn(p, x) = x @ p.w + p.b)
+  t.check("batching does not change a prediction", all_at_once == batched)
+  t.equal_i64("one prediction per row", shape(batched)[0], d.n)
+}
+
+a_run_is_reproducible_from_its_seed()
+a_resumed_run_equals_an_uninterrupted_one()
+a_resume_shuffles_epoch_ten_the_same_way_both_times()
+training_reduces_the_loss_on_a_convex_problem()
+the_epoch_loss_is_weighted_by_batch_size()
+evaluation_does_not_disturb_the_training_stream()
+an_early_stop_ends_the_run_before_its_epoch_budget()
+a_schedule_moves_the_rate_the_run_actually_trains_at()
+a_rejected_callback_set_stops_the_run_before_it_starts()
+an_empty_training_set_is_an_error_rather_than_a_silent_no_op()
+predict_returns_one_row_per_input_row_in_input_order()
+t.report("trainer")

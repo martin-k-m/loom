@@ -1,0 +1,71 @@
+mode systems
+
+import "harness.tw" as t
+import "../src/data.tw" as dt
+
+fn a_short_final_batch_is_counted_not_dropped() {
+  t.equal_i64("10 rows in batches of 4 is 3 batches", dt.batch_count(10, 4), 3)
+  t.equal_i64("12 rows in batches of 4 is 3 batches", dt.batch_count(12, 4), 3)
+  t.equal_i64("1 row in batches of 4 is 1 batch", dt.batch_count(1, 4), 1)
+  t.equal_i64("0 rows is 0 batches", dt.batch_count(0, 4), 0)
+}
+
+fn a_zero_batch_size_yields_no_batches_rather_than_dividing_by_zero() {
+  t.equal_i64("a batch size of 0 is 0 batches", dt.batch_count(10, 0), 0)
+}
+
+fn the_last_batch_stops_at_the_last_row() {
+  t.equal_i64("batch 0 of 10 rows by 4 ends at 4", dt.batch_end(10, 4, 0), 4)
+  t.equal_i64("batch 1 ends at 8", dt.batch_end(10, 4, 1), 8)
+  t.equal_i64("batch 2 ends at 10, not 12", dt.batch_end(10, 4, 2), 10)
+}
+
+fn the_batches_of_an_epoch_cover_every_row_exactly_once() {
+  let n = 23
+  let bs = 5
+  let nb = dt.batch_count(n, bs)
+  let covered = 0
+  let b = 0
+  while b < nb {
+    covered = covered + (dt.batch_end(n, bs, b) - b * bs)
+    b = b + 1
+  }
+  t.equal_i64("every row is in exactly one batch", covered, n)
+}
+
+fn an_unshuffled_epoch_order_is_the_identity() {
+  let o = dt.epoch_order(5, false)
+  t.check("row order is 0..n-1", o == tensor([0.0, 1.0, 2.0, 3.0, 4.0]))
+}
+
+fn an_empty_dataset_reports_no_rows() {
+  t.equal_i64("the empty dataset has no rows", dt.empty().n, 0)
+}
+
+fn a_split_keeps_at_least_one_row_on_each_side() {
+  let d = dt.dataset([[1.0], [2.0], [3.0], [4.0]], [0.0, 1.0, 0.0, 1.0])
+  let s = dt.split(d, 0.999, 11)
+  t.equal_i64("the validation side is not empty", s.val.n, 1)
+  t.equal_i64("the training side has the rest", s.train.n, 3)
+  let s2 = dt.split(d, 0.0001, 11)
+  t.equal_i64("the training side is not empty", s2.train.n, 1)
+}
+
+fn a_split_is_a_function_of_the_seed() {
+  let d = dt.dataset([[1.0], [2.0], [3.0], [4.0], [5.0], [6.0]], [0.0, 1.0, 0.0, 1.0, 0.0, 1.0])
+  let a = dt.split(d, 0.5, 42)
+  let b = dt.split(d, 0.5, 42)
+  t.check("the same seed splits the same way", a.train.x == b.train.x)
+  let c = dt.split(d, 0.5, 43)
+  t.check("a different seed splits differently", not (a.train.x == c.train.x))
+}
+
+a_short_final_batch_is_counted_not_dropped()
+a_zero_batch_size_yields_no_batches_rather_than_dividing_by_zero()
+the_last_batch_stops_at_the_last_row()
+the_batches_of_an_epoch_cover_every_row_exactly_once()
+an_unshuffled_epoch_order_is_the_identity()
+an_empty_dataset_reports_no_rows()
+a_split_keeps_at_least_one_row_on_each_side()
+a_split_is_a_function_of_the_seed()
+t.report("data")

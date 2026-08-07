@@ -1,0 +1,155 @@
+mode systems
+
+# metrics.tw: accumulating a metric over batches without getting the mean wrong.
+#
+# The bug this file exists to prevent: averaging the per-batch means. A loop
+# that collects one number per batch and then takes their mean is computing an
+# unweighted mean of weighted means, and it is only correct when every batch has
+# the same size. The last batch of an epoch almost never does. With 1000 rows
+# and a batch size of 256 the final batch holds 232 rows and is given the same
+# say as each 256-row batch, which moves the reported epoch loss by roughly one
+# part in a hundred. Small enough to survive review, large enough to make two
+# runs that trained identically report different numbers.
+#
+# So a meter stores a weighted sum and the total weight, and the weight is the
+# number of rows the batch value was computed over. Nothing else is correct for
+# a mean of means.
+#
+# This is only right for metrics that are themselves means over rows: loss,
+# accuracy, mean absolute error. It is wrong for a metric that is not a mean of
+# per-row quantities, and precision, recall, F1 and AUC are all in that group.
+# Those need their counts accumulated and the metric computed once at the end,
+# which is `counter` below, not `meter`.
+
+struct Meter {
+  total: F64,
+  weight: F64,
+}
+
+fn new_meter() -> Meter = Meter { total: 0.0, weight: 0.0 }
+
+# `value` is the batch mean and `count` is the number of rows it averaged over.
+fn update(m: Meter, value: F64, count: I64) {
+  m.total = m.total + value * f64(count)
+  m.weight = m.weight + f64(count)
+}
+
+# `add_total` is for a metric already summed over the batch rather than meaned.
+fn add_total(m: Meter, total: F64, count: I64) {
+  m.total = m.total + total
+  m.weight = m.weight + f64(count)
+}
+
+# An empty meter reports 0 rather than refusing. A metric asked for before any
+# batch has run is a caller bug, but returning a NaN from a division by zero
+# would propagate into a checkpoint comparison and silently disable early
+# stopping, which is worse than a visibly wrong zero.
+fn value(m: Meter) -> F64 {
+  if m.weight == 0.0 {
+    return 0.0
+  }
+  m.total / m.weight
+}
+
+fn count(m: Meter) -> I64 = i64(m.weight)
+
+fn reset(m: Meter) {
+  m.total = 0.0
+  m.weight = 0.0
+}
+
+# A set of named meters. `names` is kept alongside the dicts because report
+# order has to be stable across runs and across machines, and insertion order
+# is a property of the dict this source should not have to depend on.
+struct MeterSet {
+  totals: Dict[Str, F64],
+  weights: Dict[Str, F64],
+  names: Arr[Str],
+}
+
+fn new_meters() -> MeterSet {
+  let t: Dict[Str, F64] = {}
+  let w: Dict[Str, F64] = {}
+  let n: Arr[Str] = []
+  MeterSet { totals: t, weights: w, names: n }
+}
+
+fn has(ms: MeterSet, name: Str) -> Bool {
+  let i = 0
+  while i < len(ms.names) {
+    if ms.names[i] == name {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+fn update_named(ms: MeterSet, name: Str, value: F64, count: I64) {
+  if not has(ms, name) {
+    push(ms.names, name)
+    ms.totals[name] = 0.0
+    ms.weights[name] = 0.0
+  }
+  ms.totals[name] = ms.totals[name] + value * f64(count)
+  ms.weights[name] = ms.weights[name] + f64(count)
+}
+
+fn value_named(ms: MeterSet, name: Str) -> F64 {
+  if not has(ms, name) {
+    return 0.0
+  }
+  if ms.weights[name] == 0.0 {
+    return 0.0
+  }
+  ms.totals[name] / ms.weights[name]
+}
+
+fn reset_all(ms: MeterSet) {
+  let i = 0
+  while i < len(ms.names) {
+    ms.totals[ms.names[i]] = 0.0
+    ms.weights[ms.names[i]] = 0.0
+    i = i + 1
+  }
+}
+
+# Merge a batch's worth of named values in one call. `values` and `names` are
+# parallel and `count` is the batch size shared by all of them, which is the
+# usual case: one forward pass produces every metric for the same rows.
+fn update_batch(ms: MeterSet, names: Arr[Str], values: Arr[F64], count: I64) {
+  let i = 0
+  while i < len(names) {
+    update_named(ms, names[i], values[i], count)
+    i = i + 1
+  }
+}
+
+# A pair of integer counters, for metrics that are a ratio of counts rather
+# than a mean of per-row values. Accumulate the numerator and denominator over
+# the epoch and divide once, at the end.
+struct Counter {
+  hits: F64,
+  total: F64,
+}
+
+fn new_counter() -> Counter = Counter { hits: 0.0, total: 0.0 }
+
+fn count_up(c: Counter, hits: F64, total: F64) {
+  c.hits = c.hits + hits
+  c.total = c.total + total
+}
+
+fn ratio(c: Counter) -> F64 {
+  if c.total == 0.0 {
+    return 0.0
+  }
+  c.hits / c.total
+}
+
+# Accuracy over a batch, as a mean, so it can go straight into a meter with the
+# batch size as its weight. `logits` is [rows, classes] and `labels` is [rows].
+fn accuracy(logits: Tensor, labels: Tensor) -> F64 {
+  let pred = argmax(logits, 1)
+  item(mean(equal(pred, labels)))
+}

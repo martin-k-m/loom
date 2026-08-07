@@ -1,0 +1,113 @@
+mode systems
+
+import "harness.tw" as t
+import "../src/checkpoint.tw" as ckpt
+import "../src/state.tw" as st
+
+fn a_run(seed: I64, batch_size: I64) -> st.Run {
+  let params = [[1.0, 2.0], [3.0, 4.0]]
+  let cfg = st.config(20, batch_size, 0.01, seed)
+  st.new_run(params, st.adam(params), cfg)
+}
+
+fn advanced(r: st.Run) -> st.Run {
+  r.params = [[1.5, 2.5], [3.5, 4.5]]
+  r.opt.m = [[0.1, 0.1], [0.1, 0.1]]
+  r.opt.v = [[0.01, 0.01], [0.01, 0.01]]
+  r.opt.t = 130
+  r.st.epoch = 10
+  r.st.global_step = 130
+  r.st.lr = 0.0025
+  r.st.train_loss = 0.42
+  r
+}
+
+fn a_checkpoint_carries_the_optimiser_moments_and_step_count() {
+  let src = advanced(a_run(7, 4))
+  let none: Arr[F64] = []
+  let c = ckpt.build(src, none, 52, "test")
+  let dst = a_run(7, 4)
+  t.equal_str("restore succeeds", ckpt.restore(dst, c, 52), "")
+  t.check("the parameters came back", dst.params == src.params)
+  t.check("the first moment came back", dst.opt.m == src.opt.m)
+  t.check("the second moment came back", dst.opt.v == src.opt.v)
+  t.equal_i64("the adam step count came back", dst.opt.t, 130)
+  t.equal_i64("the epoch came back", dst.st.epoch, 10)
+  t.equal_i64("the global step came back", dst.st.global_step, 130)
+  t.near("the scheduled rate came back", dst.st.lr, 0.0025, 0.0)
+}
+
+fn restoring_leaves_the_epoch_budget_alone_so_a_resume_can_extend_a_run() {
+  let src = advanced(a_run(7, 4))
+  let none: Arr[F64] = []
+  let c = ckpt.build(src, none, 52, "test")
+  let dst = a_run(7, 4)
+  dst.cfg.epochs = 40
+  ckpt.restore(dst, c, 52)
+  t.equal_i64("the new epoch budget survives the restore", dst.cfg.epochs, 40)
+  t.equal_i64("and the run resumes at the checkpointed epoch", dst.st.epoch, 10)
+}
+
+fn restoring_clears_a_stop_so_a_stopped_run_can_be_continued_deliberately() {
+  let src = advanced(a_run(7, 4))
+  src.st.stop = true
+  src.st.stop_reason = "loss stalled"
+  let none: Arr[F64] = []
+  let c = ckpt.build(src, none, 52, "test")
+  let dst = a_run(7, 4)
+  ckpt.restore(dst, c, 52)
+  t.check("the restored run is not stopped", not dst.st.stop)
+  t.equal_str("and carries no stale reason", dst.st.stop_reason, "")
+}
+
+fn a_checkpoint_from_a_different_dataset_is_refused() {
+  let src = advanced(a_run(7, 4))
+  let none: Arr[F64] = []
+  let c = ckpt.build(src, none, 52, "test")
+  let dst = a_run(7, 4)
+  t.check("a different row count is refused", len(ckpt.restore(dst, c, 51)) > 0)
+}
+
+fn a_checkpoint_from_a_different_seed_is_refused() {
+  let src = advanced(a_run(7, 4))
+  let none: Arr[F64] = []
+  let c = ckpt.build(src, none, 52, "test")
+  let dst = a_run(8, 4)
+  t.check("a different seed is refused", len(ckpt.restore(dst, c, 52)) > 0)
+}
+
+fn a_checkpoint_from_a_different_batch_size_is_refused() {
+  let src = advanced(a_run(7, 4))
+  let none: Arr[F64] = []
+  let c = ckpt.build(src, none, 52, "test")
+  let dst = a_run(7, 8)
+  t.check("a different batch size is refused", len(ckpt.restore(dst, c, 52)) > 0)
+}
+
+fn a_checkpoint_from_a_different_optimiser_is_refused() {
+  let src = advanced(a_run(7, 4))
+  let none: Arr[F64] = []
+  let c = ckpt.build(src, none, 52, "test")
+  let dst = a_run(7, 4)
+  dst.opt = st.sgd(dst.params)
+  t.check("adam state is not restored into sgd", len(ckpt.restore(dst, c, 52)) > 0)
+}
+
+fn a_checkpoint_of_a_future_format_is_refused() {
+  let src = advanced(a_run(7, 4))
+  let none: Arr[F64] = []
+  let c = ckpt.build(src, none, 52, "test")
+  c.format = 99
+  let dst = a_run(7, 4)
+  t.check("an unknown format is refused", len(ckpt.restore(dst, c, 52)) > 0)
+}
+
+a_checkpoint_carries_the_optimiser_moments_and_step_count()
+restoring_leaves_the_epoch_budget_alone_so_a_resume_can_extend_a_run()
+restoring_clears_a_stop_so_a_stopped_run_can_be_continued_deliberately()
+a_checkpoint_from_a_different_dataset_is_refused()
+a_checkpoint_from_a_different_seed_is_refused()
+a_checkpoint_from_a_different_batch_size_is_refused()
+a_checkpoint_from_a_different_optimiser_is_refused()
+a_checkpoint_of_a_future_format_is_refused()
+t.report("checkpoint")
