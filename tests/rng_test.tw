@@ -11,6 +11,37 @@ fn an_epoch_seed_depends_only_on_the_base_and_the_epoch() {
     rng.epoch_seed(1, 8) != rng.epoch_seed(2, 8))
 }
 
+fn the_finaliser_matches_reference_splitmix64() {
+  # The regression guard for the shift-semantics bug. `shr` on `I64` is
+  # arithmetic, so writing splitmix64's finaliser with it produces a stream that
+  # is plausible, deterministic, and not splitmix64, which is the worst kind of
+  # wrong for a library that advertises reproducibility.
+  #
+  # Provenance of every number below: a Python transcription of Vigna's
+  # splitmix64, first checked against the published seed-0 output stream
+  # (0xE220A8397B1DCDAF, 0x6E789E6AA1B965F4, 0x06C45D188009454F) and then run
+  # over loom's own `mix`, `epoch_seed` and `derive`. They are measured, not
+  # chosen.
+  t.equal_i64("mix(0) is 0", rng.mix(0), 0)
+  t.equal_i64("mix(1) matches splitmix64", rng.mix(1), 6238072747940578789)
+  # The case an arithmetic shift gets wrong: the top bit is set going in.
+  t.equal_i64("mix(-1) matches splitmix64", rng.mix(-1), -5417735806833148549)
+}
+
+fn a_seed_stream_matches_the_reference() {
+  # Derived from the same reference run as above.
+  t.equal_i64("epoch_seed(1, 0)", rng.epoch_seed(1, 0), 7975592422398875729)
+  t.equal_i64("epoch_seed(1, 8)", rng.epoch_seed(1, 8), 7714393247794939415)
+  t.equal_i64("epoch_seed(1, 9)", rng.epoch_seed(1, 9), 1930566538363780839)
+  t.equal_i64("epoch_seed(0, 0)", rng.epoch_seed(0, 0), 8281593272815580517)
+  # A negative base seed, which is where the wrong shift did the most damage.
+  t.equal_i64("epoch_seed(-7919, 3)", rng.epoch_seed(-7919, 3), 9032025968119964814)
+  t.equal_i64("derive(5, init)", rng.derive(5, "init"), 1712075193739807133)
+  t.equal_i64("derive(5, split)", rng.derive(5, "split"), 7186243181731852987)
+  t.equal_i64("derive(0, init)", rng.derive(0, "init"), 6561701514392006166)
+  t.equal_i64("derive(-1, augment)", rng.derive(-1, "augment"), 4096769024687156324)
+}
+
 fn an_epoch_seed_is_never_negative() {
   # seed() takes a non-negative value and the mix spans the signed range, so
   # this is the property the masking in epoch_seed exists to hold.
@@ -47,6 +78,8 @@ fn a_derived_seed_is_not_an_epoch_seed() {
     rng.derive(9, "init") != rng.epoch_seed(9, 0))
 }
 
+the_finaliser_matches_reference_splitmix64()
+a_seed_stream_matches_the_reference()
 an_epoch_seed_depends_only_on_the_base_and_the_epoch()
 an_epoch_seed_is_never_negative()
 consecutive_epochs_do_not_produce_adjacent_seeds()

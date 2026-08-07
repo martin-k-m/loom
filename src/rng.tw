@@ -29,13 +29,28 @@ let MIX_A = 6364136223846793005
 let MIX_B = -4658895280553007687
 let MIX_C = -7723592293110705685
 
+let SIGN_BIT: I64 = shl(1, 63)
+
+# Logical right shift, because `shr` on `I64` is arithmetic: see the operators
+# section of twill's docs/language-guide.md. splitmix64's finaliser shifts a
+# value that is unsigned in the reference and whose top bit is set roughly half
+# the time, so an arithmetic shift smears ones down and the stream diverges from
+# the reference silently. Clearing the sign bit before the shift and putting it
+# back at its shifted position is the same construction as twill's
+# `src/float.tw` `ushr`, which exists for the same reason.
+fn ushr(x: I64, k: I64) -> I64 {
+  if k == 0 { return x }
+  if x >= 0 { return shr(x, k) }
+  or(shr(and(x, not(SIGN_BIT)), k), shl(1, 63 - k))
+}
+
 fn mix(x: I64) -> I64 {
   let z = x
-  z = xor(z, shr(z, 30))
+  z = xor(z, ushr(z, 30))
   z = z * MIX_B
-  z = xor(z, shr(z, 27))
+  z = xor(z, ushr(z, 27))
   z = z * MIX_C
-  z = xor(z, shr(z, 31))
+  z = xor(z, ushr(z, 31))
   z
 }
 

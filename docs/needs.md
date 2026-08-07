@@ -132,10 +132,18 @@ does not say whether they are infix operators, builtin functions, or methods.
 
 loom writes them as builtin calls, `xor(a, b)` and `shr(z, 30)`, because `and`
 and `or` are already the short-circuiting logical operators in numeric mode and
-overloading them on I64 seems worse than a function. It also assumes `shr` is a
-logical shift, which matters: splitmix64's finaliser is wrong with an arithmetic
-shift, and every seed derived from a negative base seed would be wrong with it.
-This is the one place in loom where the wrong answer is silent.
+overloading them on I64 seems worse than a function.
+
+`shr` has since been specified, in twill's `docs/language-guide.md` operators
+section: it is an **arithmetic** shift, and twill's `docs/needs.md` NEEDS-85 is
+the entry that settles it. loom used to assume the opposite, and that assumption
+was wrong rather than merely unstated: splitmix64's finaliser is a different
+generator under an arithmetic shift, so every seed derived from a value with its
+top bit set was silently off the reference stream. `src/rng.tw` now carries a
+`ushr` built the same way as twill's `src/float.tw` `ushr`, and
+`tests/rng_test.tw` pins the finaliser and the seed stream to values taken from
+a reference splitmix64. What is still wanted from the language is a native
+logical shift so the helper can be deleted, not a change of semantics.
 
 ### 8. twill's terminal layer, reachable from a package
 
