@@ -262,3 +262,67 @@ first entry.
 The useful part of a progress bar for a 400-epoch run is the time remaining,
 not the fill. loom cannot compute it. This is the same requirement bobbin has
 and it should be satisfied once.
+
+### 17. A dtype as a value, and a name for its type
+
+**Needs:** a dtype storable in a struct field and passable as an argument, and
+a type name for it in an annotation
+**Used by:** `src/precision.tw` (`Policy`, `narrow`)
+**Status:** twill's NEEDS-110 makes the seven dtype names contextual
+identifiers, read as dtypes only where a constructor or `.to` expects one.
+`docs/dtypes.md` there calls a dtype "a name in the term language", but no
+annotation spelling exists and no other position reads one.
+
+A precision policy is one value answering one question, what dtype the forward
+pass runs in, so `Policy` wants a `compute: Dtype` field and `narrow` wants
+`t.to(pol.compute)`. Neither is writable. The argument of `.to` is a position
+where a bare name is read as a dtype, not an expression evaluated to one, and
+even if it were, systems mode makes annotations mandatory and the type of a
+dtype value has no name. loom works around it the way `OptState.kind` works
+around entry 5: an I64 discriminant and an if-chain in `narrow` with each
+dtype name written out literally, with the same failure mode, since a new
+dtype in twill means finding every such chain by hand.
+
+The adjacent gap: nothing reads a dtype back off a tensor, so
+`tests/precision_test.tw` asserts that narrowing happened by observing that
+values rounded, a behavioural proxy for a property the runtime already holds.
+twill's NEEDS-114 covers printing it; introspecting it is not written down
+anywhere.
+
+### 18. A value-level scaled backward
+
+**Needs:** `backward_scaled` and `grads_finite` reachable from the level a
+framework works at, or the tape exposed
+**Used by:** `src/precision.tw` (`mixed_step`)
+**Status:** twill's NEEDS-112 names `backward_scaled(tp, root, seed, scale)`
+and `grads_finite(gs)`. The first takes a tape and a node, and loom never
+holds either: `value_and_grad` is the entire autodiff surface a training
+framework sees.
+
+`mixed_step` reproduces `backward_scaled`'s arithmetic by multiplying the loss
+by the scale inside the differentiated closure, which by the chain rule scales
+every gradient by exactly the same factor, so the result is identical. The
+reason this entry exists anyway is the reason NEEDS-112 gives for naming the
+functions at all: a hand-rolled version that forgets the skip looks like it
+works. loom's copy has the skip; the point of putting the loop in the runtime
+is that the next caller's does too. Wanted: either a
+`value_and_grad_scaled(f, scale)` beside `value_and_grad`, or the tape as a
+value so `backward_scaled` is callable as specified.
+
+There is a second wall behind the first: `backward_scaled` returns
+`Res[Arr[Tensor], Str]`, and the subset has no `Res` (entry 4), so even with a
+tape in hand the result is not consumable today.
+
+### 19. The leaves of a tree, as an array
+
+**Needs:** `leaves(tree) -> Arr[Tensor]`, or a fold over leaves
+**Used by:** `src/precision.tw` (`leaves_of`, feeding `grads_finite`)
+**Status:** `map_leaves` and `zip_leaves` exist; nothing enumerates.
+
+`grads_finite` takes `Arr[Tensor]` and a gradient arrives as a tree.
+`leaves_of` collects the leaves by abusing `map_leaves` for its visit order: a
+helper pushes each leaf into a captured array and returns it unchanged, and
+the mapped tree is thrown away. It works because arrays are captured by
+reference (entry 10) and it reads like what it is. The shape of the problem is
+entry 11's sort and entry 14's `continue` again: the subset has the traversal
+and not the escape hatch.
