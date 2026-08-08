@@ -49,8 +49,9 @@ hang early stopping. That is loom.
 | Checkpoint and restore covering parameters, optimiser state and epoch | written, unrun |
 | Batch-size-weighted metric accumulation | written, unrun |
 | Reproducibility from one explicit seed, threaded, no hidden global | written, unrun |
+| Mixed precision: bf16 and f16 policies, f32 masters, dynamic loss scaling | written, unrun |
 | Coloured output and a progress bar with a time estimate | **not possible.** See below |
-| Distributed training, mixed precision, gradient accumulation | **not in v0.1** |
+| Distributed training, gradient accumulation | **not in v0.1** |
 | Anything running end to end | **no** |
 
 ## The loop is not hidden
@@ -223,6 +224,64 @@ does not shift the batch orders of a run that previously had none.
 The cost: within an epoch the stream is still positional, which is why
 checkpoints are on epoch boundaries.
 
+## Mixed precision, and why bf16
+
+twill's dtype design (`docs/dtypes.md` in the twill repository) gives training
+three rules: the forward pass may run narrow, gradients are never narrower than
+f32, and anything narrower than f32 accumulates in f32. `src/precision.tw`
+turns those into a policy. Adopting one is one changed line in a step function
+and one call on the initial parameters:
+
+```rust
+import "twill_modules/loom/src/precision.tw" as prec
+
+let POLICY = prec.mixed_bf16()
+
+fn step(p: Tree, opt: st.OptState, x: Tensor, y: Tensor, lr: F64) -> st.StepResult {
+  prec.mixed_step(POLICY, p, opt, x, y, lr, loss_fn)
+}
+
+let params = prec.masters(init_model())
+```
+
+`masters` makes the parameters f32. `mixed_step` narrows them, and the batch,
+to the policy's dtype for the forward pass, so the activations and the matmuls
+that move the memory run narrow; twill's autodiff hands the gradients back at
+f32, and the optimiser updates the f32 masters, which are what checkpoints
+capture. The narrow weights are a rounded copy, remade every step. Evaluate
+with the same policy: an `eval_batch` that runs the masters wide measures a
+model the run is not training.
+
+**Use `prec.mixed_bf16()`.** bf16 and f16 are the same sixteen bits spent
+differently. bf16 keeps f32's exponent range and about three significant
+digits, so every gradient representable in f32 is representable in bf16 and it
+trains with no extra machinery. f16 carries about half a digit more precision
+in a range that ends at 65504 and loses gradients below f16's smallest normal,
+so it cannot train bare: a gradient that underflows to zero is a parameter
+that stops learning and reports nothing.
+
+`prec.mixed_f16()` therefore runs dynamic loss scaling: the loss is multiplied
+by a scale before the backward pass, which by the chain rule multiplies every
+gradient by the same factor and lifts it into representable range; the scale is
+divided back out before the optimiser sees anything. When a gradient still
+comes back non-finite the step is **skipped** and the scale halved; after 2000
+clean steps the scale doubles, probing for the largest value the model
+tolerates. The skip is the part that matters. Clipping an infinity to a large
+finite number is a plausible-looking update in an arbitrary direction, and a
+run built on it trains to a worse model while reporting nothing. A skipped
+batch costs one batch, and `Policy.skipped` counts them.
+
+So: f16's extra half digit rarely pays for the scaling machinery, and the
+machinery is only as good as the run that remembers all of it. That is the
+twill design's recommendation, and it is loom's.
+
+Two limits, stated rather than discovered. Until twill's packed buffer lands
+(NEEDS-111 there), a policy changes the arithmetic, exactly as a 16-bit run
+would compute it, and saves no memory. And the loss-scale state is not
+checkpointed: a resumed f16 run re-converges its scale rather than restoring
+it, so it is not bit-identical to an uninterrupted run while the scales
+differ. bf16 has no such window, which is one more reason it is the default.
+
 ## No colour, and no progress estimate
 
 Stated plainly because it is a gap and not a decision. twill has a real terminal
@@ -261,6 +320,7 @@ src/state.tw        Config, State, Run, OptState, StepResult
 src/data.tw         Dataset, batching, a seeded split
 src/metrics.tw      weighted meters, meter sets, ratio counters
 src/rng.tw          the seed, derived and threaded
+src/precision.tw    the precision policy: masters, narrowing, the scaled step
 src/callback.tw     hook points, the ordering, and the five callbacks
 src/checkpoint.tw   what is captured, what is not, and the refusals
 src/report.tw       fixed-width formatting, a human line and a JSON line

@@ -27,6 +27,11 @@ Added:
   kind or row count is refused.
 - One explicit seed, threaded through a per-epoch derivation, so a resumed run
   reproduces an uninterrupted one exactly at epoch granularity.
+- Mixed precision as a policy the step function takes: bf16 or f16 forward
+  passes over f32 master weights, with dynamic loss scaling for f16 that skips
+  the step and halves the scale on a non-finite gradient and doubles it after
+  a run of clean steps. bf16 is the documented recommendation; it needs no
+  scaling at all.
 
 Known gaps, deliberate for v0.1:
 
@@ -34,4 +39,6 @@ Known gaps, deliberate for v0.1:
   not reachable from an installed package; `docs/needs.md` entry 8.
 - No mid-epoch checkpointing. The generator's position is not readable;
   `docs/needs.md` entry 6.
-- No distributed training, no mixed precision, no gradient accumulation.
+- No distributed training and no gradient accumulation.
+- The loss-scale state is not checkpointed. A resumed f16 run re-converges its
+  scale rather than restoring it; a resumed bf16 run has nothing to converge.
