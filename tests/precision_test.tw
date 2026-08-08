@@ -1,0 +1,172 @@
+mode systems
+
+# What mixed precision must get right is the unhealthy batch. A loss-scaling
+# implementation that clips instead of skipping is indistinguishable from a
+# correct one on every healthy step, so these tests manufacture the overflow
+# and check what happens to the step, the scale and the reported loss.
+
+import "harness.tw" as t
+import "../src/precision.tw" as prec
+import "../src/trainer.tw" as tr
+import "../src/state.tw" as st
+import "../src/data.tw" as dt
+import "../src/metrics.tw" as met
+import "../src/callback.tw" as cb
+
+# The same convex problem the trainer tests use.
+fn quad_loss(p: Tree, x: Tensor, y: Tensor) -> Tensor {
+  let err = x @ p.w + p.b - y
+  mean(err * err)
+}
+
+# 10^p, built by loop because the source avoids assuming scientific-notation
+# literals; nothing in the subset promises them.
+fn big10(p: I64) -> F64 {
+  let v = 1.0
+  let i = 0
+  while i < p {
+    v = v * 10.0
+    i = i + 1
+  }
+  v
+}
+
+# A loss whose gradient with respect to every weight is 10^35, so under any
+# scale of two or more the scaled f32 cotangent overflows to infinity. The
+# loss value itself stays finite at w = 0, which is the nastier case: the
+# forward pass looks healthy and only the gradient says otherwise.
+fn exploding_loss(p: Tree, x: Tensor, y: Tensor) -> Tensor {
+  sum(p.w) * big10(35)
+}
+
+fn fresh_masters() -> Tree = prec.masters({ w: [0.5, -0.25], b: 0.0 })
+
+fn toy() -> dt.Dataset {
+  let x = [[1.0, 1.0], [2.0, 1.0], [1.0, 3.0], [3.0, 2.0], [0.0, 1.0],
+           [4.0, 1.0], [2.0, 2.0], [1.0, 0.0], [3.0, 3.0], [2.0, 4.0]]
+  let y = [1.0, 3.0, -3.0, 2.0, -2.0, 6.0, 0.0, 3.0, -1.0, -5.0]
+  dt.dataset(x, y)
+}
+
+fn narrowing_rounds_and_the_full_policy_does_not() {
+  # 0.2001 needs more than bf16's eight significand bits, so the narrow copy
+  # must differ from the master. Compared by value because a dtype cannot be
+  # read back off a tensor; see docs/needs.md entry 17.
+  let m = prec.masters({ w: [0.2001, 0.7003], b: 0.1 })
+  let pol = prec.mixed_bf16()
+  t.check("a bf16 copy rounds what f32 carries",
+    not (prec.narrow_tree(pol, m) == m))
+  let whole = prec.full()
+  t.check("the full policy narrows nothing", prec.narrow_tree(whole, m) == m)
+}
+
+fn a_non_finite_gradient_skips_the_step_and_halves_the_scale() {
+  let pol = prec.mixed_f16()
+  let params = fresh_masters()
+  let opt = st.adam(params)
+  let d = toy()
+  let res = prec.mixed_step(pol, params, opt, d.x, d.y, 0.05, exploding_loss)
+  t.check("the parameters did not move", res.params == fresh_masters())
+  t.equal_i64("adam's step count did not advance", res.opt.t, 0)
+  t.near("the scale halved", pol.scale, 32768.0, 0.0)
+  t.equal_i64("the skip was counted", pol.skipped, 1)
+  t.equal_i64("the clean-step run restarted", pol.good, 0)
+}
+
+fn a_skipped_step_reports_the_last_finite_loss_not_a_nan() {
+  let pol = prec.mixed_f16()
+  let params = fresh_masters()
+  let opt = st.adam(params)
+  let d = toy()
+  let ok = prec.mixed_step(pol, params, opt, d.x, d.y, 0.05, quad_loss)
+  t.check("a healthy step reports a finite positive loss", ok.loss > 0.0)
+  let bad = prec.mixed_step(pol, ok.params, ok.opt, d.x, d.y, 0.05, exploding_loss)
+  t.near("the skipped step reports the last finite loss", bad.loss, ok.loss, 0.0)
+}
+
+fn clean_steps_double_the_scale_after_the_growth_interval() {
+  let pol = prec.mixed_f16()
+  pol.growth = 2
+  let params = fresh_masters()
+  let opt = st.adam(params)
+  let d = toy()
+  let one = prec.mixed_step(pol, params, opt, d.x, d.y, 0.05, quad_loss)
+  t.near("one clean step does not double", pol.scale, 65536.0, 0.0)
+  prec.mixed_step(pol, one.params, one.opt, d.x, d.y, 0.05, quad_loss)
+  t.near("two clean steps double", pol.scale, 131072.0, 0.0)
+  t.equal_i64("and the run restarts", pol.good, 0)
+}
+
+fn the_scale_never_falls_below_one() {
+  let pol = prec.mixed_f16()
+  pol.scale = 1.0
+  let params = fresh_masters()
+  let opt = st.adam(params)
+  let d = toy()
+  prec.mixed_step(pol, params, opt, d.x, d.y, 0.05, exploding_loss)
+  t.near("the floor holds", pol.scale, 1.0, 0.0)
+}
+
+fn the_bf16_policy_never_scales() {
+  let pol = prec.mixed_bf16()
+  pol.growth = 1
+  let params = fresh_masters()
+  let opt = st.adam(params)
+  let d = toy()
+  let res = prec.mixed_step(pol, params, opt, d.x, d.y, 0.05, quad_loss)
+  prec.mixed_step(pol, res.params, res.opt, d.x, d.y, 0.05, quad_loss)
+  t.near("the scale stays pinned at one", pol.scale, 1.0, 0.0)
+}
+
+fn the_full_policy_is_default_step() {
+  let pol = prec.full()
+  let a_params = fresh_masters()
+  let a = prec.mixed_step(pol, a_params, st.adam(a_params), toy().x, toy().y, 0.05, quad_loss)
+  let b_params = fresh_masters()
+  let b = tr.default_step(b_params, st.adam(b_params), toy().x, toy().y, 0.05, quad_loss)
+  t.check("the two steps agree on the weights", a.params == b.params)
+  t.near("and on the loss", a.loss, b.loss, 0.0)
+}
+
+# The policy at module level and a top-level step function referencing it,
+# which is the arrangement the README shows and the reason mixed_step takes
+# the policy as its first argument.
+let POLICY = prec.mixed_bf16()
+
+fn policy_step(p: Tree, opt: st.OptState, x: Tensor, y: Tensor, lr: F64) -> st.StepResult {
+  prec.mixed_step(POLICY, p, opt, x, y, lr, quad_loss)
+}
+
+fn eval_batch(p: Tree, x: Tensor, y: Tensor) -> met.MeterSet {
+  let ms = met.new_meters()
+  met.update_named(ms, "loss", item(quad_loss(prec.narrow_tree(POLICY, p), x, y)), shape(x)[0])
+  ms
+}
+
+fn a_bf16_run_fits_under_the_trainer() {
+  let none: Arr[cb.Callback] = []
+  let p = fresh_masters()
+  let cfg = st.config(1, 4, 0.05, 3)
+  cfg.verbose = false
+  let short = st.new_run(p, st.adam(p), cfg)
+  tr.fit(short, none, toy(), dt.empty(), policy_step, eval_batch)
+  let early = short.st.train_loss
+
+  let p2 = fresh_masters()
+  let cfg2 = st.config(60, 4, 0.05, 3)
+  cfg2.verbose = false
+  let long = st.new_run(p2, st.adam(p2), cfg2)
+  tr.fit(long, none, toy(), dt.empty(), policy_step, eval_batch)
+  t.check("sixty bf16 epochs beat one", long.st.train_loss < early)
+  t.equal_i64("and nothing was skipped", POLICY.skipped, 0)
+}
+
+narrowing_rounds_and_the_full_policy_does_not()
+a_non_finite_gradient_skips_the_step_and_halves_the_scale()
+a_skipped_step_reports_the_last_finite_loss_not_a_nan()
+clean_steps_double_the_scale_after_the_growth_interval()
+the_scale_never_falls_below_one()
+the_bf16_policy_never_scales()
+the_full_policy_is_default_step()
+a_bf16_run_fits_under_the_trainer()
+t.report("precision")

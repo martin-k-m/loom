@@ -1,0 +1,231 @@
+mode systems
+
+# precision.tw: the dtype a run trains in, as a policy rather than a habit.
+#
+# twill's docs/dtypes.md is the design; this file is the training half of it.
+# The arrangement is the standard mixed-precision one, and every piece of it is
+# load-bearing:
+#
+#   master weights   f32, held in Run.params, updated by the optimiser, and
+#                    the thing a checkpoint captures. The narrow weights the
+#                    forward pass sees are a rounded copy of these, remade
+#                    from them on every step.
+#   forward pass     the policy's dtype, bf16 or f16. The batch is narrowed
+#                    along with the weights, so the activations are narrow
+#                    too and the matmuls that move the memory run narrow.
+#                    Inside each kernel the accumulation is f32 by twill's
+#                    accumulation rule; loom does nothing to get that.
+#   gradients        f32, always. twill's autodiff allocates every cotangent
+#                    at grad_dtype(dtype), which is f32 for anything narrower,
+#                    so the optimiser sees f32 gradients without loom lifting
+#                    a finger.
+#   optimiser state  f32, because the moments are trees shaped like the
+#                    masters.
+#
+# The policy rides in the step, not in fit. Mixed precision is part of the
+# update rule, and loom's whole design is that the update rule stays in the
+# caller's file: a fit that took a policy would be a fit that quietly rewrote
+# the step it was handed. `mixed_step` below has the same shape as
+# `tr.default_step`, so adopting a policy is one changed line in a step
+# function and nothing anywhere else.
+#
+# Two honest limits, stated here rather than discovered:
+#
+# - Nothing is saved in bytes yet. Until twill's NEEDS-111 lands a packed
+#   buffer, a bf16 tensor still occupies 64 bits per element. What a policy
+#   changes today is the arithmetic, exactly as a 16-bit run would compute it,
+#   which is the part worth writing first and the part that is wrong in most
+#   implementations.
+# - The loss-scale state is not checkpointed. A resumed f16 run restarts at
+#   the initial scale and re-converges on its own, which dynamic scaling is
+#   built to do, but the resumed run is not bit-identical to an uninterrupted
+#   one while the scales differ. bf16 has no such window, which is one more
+#   reason it is the default recommendation.
+#
+# Evaluate what you train. An eval_batch that runs the masters wide is
+# measuring a model the run is not training; narrow inside it with the same
+# policy, and cast logits up with .to(f32) before a softmax if the metric
+# wants the headroom.
+
+import "state.tw" as st
+import "trainer.tw" as tr
+
+# 0 full, 1 bf16, 2 f16. An I64 discriminant for the same reason OptState.kind
+# is one: the subset has no sum types (docs/needs.md entry 5). It is also
+# standing in for a dtype-valued field, which the language cannot spell at all
+# (docs/needs.md entry 17).
+let PREC_FULL = 0
+let PREC_BF16 = 1
+let PREC_F16 = 2
+
+struct Policy {
+  kind: I64,
+  # The current loss scale. 1.0 and pinned for full and bf16; dynamic for f16.
+  # Always a power of two, so scaling and unscaling touch only the exponent
+  # and never re-round a mantissa.
+  scale: F64,
+  # Clean steps between doublings: the growth interval.
+  growth: I64,
+  # Clean steps since the last overflow or doubling.
+  good: I64,
+  min_scale: F64,
+  max_scale: F64,
+  # Steps skipped because a gradient came back non-finite. A healthy f16 run
+  # skips one step per doubling attempt that probes too far; a run where this
+  # climbs steadily has a numerics problem the scale cannot fix.
+  skipped: I64,
+  # The last finite batch loss, reported in place of a non-finite one on a
+  # skipped step, so a NaN never enters the epoch meter. src/metrics.tw
+  # explains what a NaN in a meter silently disables.
+  last_loss: F64,
+}
+
+# Full precision: f64 end to end, exactly what loom does without this file.
+# It exists so a step function can flip between policies by changing one
+# constructor rather than its own text.
+fn full() -> Policy {
+  Policy { kind: PREC_FULL, scale: 1.0, growth: 1000000000, good: 0,
+           min_scale: 1.0, max_scale: 1.0, skipped: 0, last_loss: 0.0 }
+}
+
+# The recommended policy. bf16 keeps f32's exponent range, so every gradient
+# representable in f32 is representable in bf16 and no loss scaling is needed:
+# the scale is pinned at 1.0 and the machinery below reduces to the skip,
+# which any dtype deserves. See docs/dtypes.md, "bf16 against f16, honestly".
+fn mixed_bf16() -> Policy {
+  Policy { kind: PREC_BF16, scale: 1.0, growth: 1000000000, good: 0,
+           min_scale: 1.0, max_scale: 1.0, skipped: 0, last_loss: 0.0 }
+}
+
+# f16, which cannot train bare: its range ends at 65504 and real gradients go
+# under its smallest normal, 2^-14. So this policy carries dynamic loss
+# scaling. 65536 is the conventional starting scale, 2000 the conventional
+# growth interval, and the cap at 2^24 stops a model whose gradients are
+# routinely tiny from doubling forever and spending every 2000th step
+# overflowed on purpose.
+fn mixed_f16() -> Policy {
+  Policy { kind: PREC_F16, scale: 65536.0, growth: 2000, good: 0,
+           min_scale: 1.0, max_scale: 16777216.0, skipped: 0, last_loss: 0.0 }
+}
+
+# ---- narrowing ------------------------------------------------------------
+
+# f32 masters from whatever the caller initialised. Call it once, on the tree
+# that goes into new_run, so the optimiser updates and the checkpoint captures
+# f32 weights rather than f64 ones.
+fn masters(params: Tree) -> Tree = map_leaves(fn(w) = w.to(f32), params)
+
+# The if-chain over kind exists because a dtype cannot be stored in a struct
+# field and handed to .to: dtype names are contextual, read only where a
+# constructor or .to expects one, so each name has to be written out here
+# literally. See docs/needs.md entry 17.
+fn narrow(pol: Policy, t: Tensor) -> Tensor {
+  if pol.kind == PREC_BF16 {
+    return t.to(bf16)
+  }
+  if pol.kind == PREC_F16 {
+    return t.to(f16)
+  }
+  t
+}
+
+fn narrow_tree(pol: Policy, master: Tree) -> Tree =
+  map_leaves(fn(w) = narrow(pol, w), master)
+
+# ---- the leaves, for grads_finite -----------------------------------------
+
+# grads_finite takes Arr[Tensor] and a gradient arrives as a tree, so the
+# leaves are collected by abusing map_leaves for its visit order: `keep`
+# pushes each leaf and returns it unchanged. It works because arrays are
+# captured by reference. A leaves() builtin would delete both functions;
+# docs/needs.md entry 19.
+fn keep(out: Arr[Tensor], t: Tensor) -> Tensor {
+  push(out, t)
+  t
+}
+
+fn leaves_of(g: Tree) -> Arr[Tensor] {
+  let out: Arr[Tensor] = []
+  map_leaves(fn(t) = keep(out, t), g)
+  out
+}
+
+# ---- the scale ------------------------------------------------------------
+
+fn half_scale(pol: Policy) -> F64 {
+  let next = pol.scale * 0.5
+  if next < pol.min_scale {
+    return pol.min_scale
+  }
+  next
+}
+
+fn double_scale(pol: Policy) -> F64 {
+  let next = pol.scale * 2.0
+  if next > pol.max_scale {
+    return pol.max_scale
+  }
+  next
+}
+
+# ---- the step -------------------------------------------------------------
+
+# One optimiser update under the policy, shaped exactly like tr.default_step
+# so the two are interchangeable inside a step function. Mutates the policy's
+# scale state, which is why the policy lives at module level in the caller's
+# file: the step signature fit accepts has no slot for it, and a top-level
+# step function cannot close over a local.
+fn mixed_step(pol: Policy, params: Tree, opt: st.OptState, x: Tensor, y: Tensor,
+              lr: F64, loss_fn: fn(Tree, Tensor, Tensor) -> Tensor) -> st.StepResult {
+  if pol.kind == PREC_FULL {
+    return tr.default_step(params, opt, x, y, lr, loss_fn)
+  }
+  # The batch is narrowed along with the weights. Leaving x wide would let
+  # promotion widen the first matmul straight back out and silently undo the
+  # policy, which is exactly the regression twill's NEEDS-113 wants a checker
+  # warning for. y is not narrowed: labels are indices, and a rounded target
+  # is a different dataset.
+  let xn = narrow(pol, x)
+  let s = pol.scale
+  # The loss is multiplied by the scale inside the differentiated closure, so
+  # by the chain rule every gradient comes back scaled by exactly s. This is
+  # the same arithmetic as twill's backward_scaled, which loom cannot call:
+  # that surface takes the tape, and a framework built on value_and_grad
+  # never holds one. See docs/needs.md entry 18.
+  #
+  # Differentiating through the narrowing is what makes this a master-weights
+  # scheme: the cast's vjp hands each gradient back at the master's dtype,
+  # f32, and the optimiser below updates the f32 masters directly.
+  let vg = value_and_grad(fn(p) = loss_fn(narrow_tree(pol, p), xn, y) * s)(params)
+  let g = vg[1]
+  if not grads_finite(leaves_of(g)) {
+    # The step is SKIPPED, not clipped, and the skip is the load-bearing
+    # behaviour of this whole file. Clipping an infinity to a large finite
+    # number is a plausible-looking update in an arbitrary direction: the
+    # run keeps going, trains to a worse model, and reports nothing. A
+    # skipped step costs one batch and is visible in Policy.skipped.
+    # Returning opt untouched also leaves adam's t where it was, so the bias
+    # correction does not advance for an update that never happened.
+    pol.scale = half_scale(pol)
+    pol.good = 0
+    pol.skipped = pol.skipped + 1
+    return st.StepResult { loss: pol.last_loss, params: params, opt: opt }
+  }
+  # Unscale before the optimiser sees anything. Multiplying by 1/s rather
+  # than dividing per element is exact either way, because the scale is a
+  # power of two.
+  let inv = 1.0 / s
+  let gu = map_leaves(fn(t) = t * inv, g)
+  pol.good = pol.good + 1
+  if pol.good >= pol.growth {
+    # A run of clean steps means the scale may be smaller than the model
+    # tolerates. Probe upward; if the probe was too far, the next overflow
+    # halves it back and the run has converged on the largest scale that
+    # fits. This is what makes the scale a measurement rather than a tuning.
+    pol.scale = double_scale(pol)
+    pol.good = 0
+  }
+  let loss = item(vg[0]) / s
+  pol.last_loss = loss
+  tr.apply(params, gu, opt, lr, loss)
+}
