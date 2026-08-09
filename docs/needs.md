@@ -283,6 +283,15 @@ around entry 5: an I64 discriminant and an if-chain in `narrow` with each
 dtype name written out literally, with the same failure mode, since a new
 dtype in twill means finding every such chain by hand.
 
+Half of this landed after it was written: twill grew a `dtype(t)` builtin that
+returns a tensor's dtype as a name string, so the read direction exists and a
+policy can now assert what a tensor actually is, which is what `grads_finite`
+and a mixed-precision sanity check want. The half that is still missing is the
+one this entry is really about: a dtype as a value to store in `Policy.compute`
+and hand to `.to`. `dtype(t)` gives a string, and the `.to` argument is a
+contextual name and not a string, so the two do not yet meet. The if-chain
+stays until they do.
+
 The adjacent gap: nothing reads a dtype back off a tensor, so
 `tests/precision_test.tw` asserts that narrowing happened by observing that
 values rounded, a behavioural proxy for a property the runtime already holds.
