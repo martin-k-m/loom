@@ -12,4 +12,4 @@ entry = "src/trainer.tw"
 # std/data this source was written against. spool has no notion of a toolchain
 # dependency, so it is declared as an ordinary git dependency: the version is
 # the thing that matters and vendoring the twill tree does no harm.
-twill = { version = "^0.28.0", git = "https://github.com/martin-k-m/twill" }
+twill = { version = "^1.2.0", git = "https://github.com/martin-k-m/twill" }
