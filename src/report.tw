@@ -2,20 +2,26 @@ mode systems
 
 # report.tw: the lines a run prints.
 #
-# These are plain, uncoloured, and single-line. twill has a real terminal layer
-# in src/term/ and a progress bar in src/cli/progress.tw, and this file would
-# rather call them than reimplement them. It cannot: those are files inside the
-# twill repository, and twill resolves a non-std import as a path relative to
-# the importing file. Only modules under std/ are reachable from an installed
-# package, and the terminal layer is not one of them. See docs/needs.md entry 8.
+# These are single-line, and now they are lit. twill's terminal layer became
+# reachable from a package once its modules began importing each other by a path
+# relative to the importer, so this file vendors it the same way weft and bobbin
+# do, rather than reimplementing it. Capabilities are detected once per line and
+# every escape goes through ansi.paint, which drops to plain text the moment the
+# output is piped or the terminal cannot colour, so a redirected log is still
+# the same bare columns it always was.
 #
-# The consequence, stated so nobody goes looking for it: loom has no progress
-# bar, no colour, and no carriage-return repainting. A progress callback prints
-# one line per epoch. That is worse than the bar twill already has and it is not
-# a design decision.
+# What is lit and why: the loss value, because it is the number a person's eye
+# tracks down the column, and the bar's fill, because a bar that is one colour
+# with its track is harder to read at a glance than one that is two. The labels
+# stay quiet so the values carry the line. This is still a per-epoch line and
+# not the stateful bar with a rate and an ETA from src/cli/progress.tw; adopting
+# that means threading a clock through the trainer, which is its own change.
 
 import "state.tw" as st
 import "metrics.tw" as met
+import "../twill_modules/twill/src/term/caps.tw" as cp
+import "../twill_modules/twill/src/term/ansi.tw" as ansi
+import "../twill_modules/twill/src/cli/theme.tw" as th
 
 # A fixed-width decimal. `str` on an F64 prints a shortest round-trip form,
 # which is right for a value being read back and wrong for a column of losses,
@@ -81,14 +87,17 @@ fn epoch_label(epoch: I64, epochs: I64) -> Str {
 # The per-epoch line. Validation metrics are appended in the order they were
 # first recorded, which src/metrics.tw fixes, so the columns are the same on
 # every line of a run and diffing two runs' logs lines up.
-fn epoch_line(s: st.State) -> Str {
-  let out = epoch_label(s.epoch, s.epochs)
-    + "  loss " + fixed(s.train_loss, 4)
-    + "  lr " + fixed(s.lr, 6)
+fn epoch_line(s: st.State, caps: cp.Caps) -> Str {
+  let out = ansi.paint(caps, th.muted(), epoch_label(s.epoch, s.epochs))
+    + ansi.paint(caps, th.muted(), "  loss ")
+    + ansi.paint(caps, th.code(), fixed(s.train_loss, 4))
+    + ansi.paint(caps, th.muted(), "  lr ")
+    + ansi.paint(caps, th.code(), fixed(s.lr, 6))
   let i = 0
   while i < len(s.val.names) {
     let name = s.val.names[i]
-    out = out + "  val_" + name + " " + fixed(met.value_named(s.val, name), 4)
+    out = out + ansi.paint(caps, th.muted(), "  val_" + name + " ")
+      + ansi.paint(caps, th.code(), fixed(met.value_named(s.val, name), 4))
     i = i + 1
   }
   out
@@ -115,20 +124,29 @@ fn epoch_json(s: st.State) -> Str {
 # A textual progress indication, printed once per epoch. It is a fill without a
 # time estimate, and the estimate is the part that would actually help. See the
 # note at the top of this file for why it is not here.
-fn bar(done: I64, total: I64, width: I64) -> Str {
+fn bar(done: I64, total: I64, width: I64, caps: cp.Caps) -> Str {
   if total <= 0 {
-    return "[" + pad_right("", width) + "]"
+    return ansi.paint(caps, th.muted(), "[" + pad_right("", width) + "]")
   }
   let filled = done * width / total
-  let out = "["
+  # A solid block reads as a fill where the terminal can draw it; the ASCII
+  # hash is the same shape in a font that cannot. The fill is mint, twill's
+  # colour for progress and structure, and the track is left quiet behind it.
+  let fill_glyph = if caps.unicode { "█" } else { "#" }
+  let track_glyph = if caps.unicode { "─" } else { "." }
+  let fill = ""
   let i = 0
-  while i < width {
-    if i < filled {
-      out = out + "#"
-    } else {
-      out = out + "."
-    }
+  while i < filled {
+    fill = fill + fill_glyph
     i = i + 1
   }
-  out + "]"
+  let track = ""
+  while i < width {
+    track = track + track_glyph
+    i = i + 1
+  }
+  ansi.paint(caps, th.muted(), "[")
+    + ansi.paint(caps, th.success(), fill)
+    + ansi.paint(caps, th.muted(), track)
+    + ansi.paint(caps, th.muted(), "]")
 }

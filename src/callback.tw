@@ -78,6 +78,7 @@ import "state.tw" as st
 import "metrics.tw" as met
 import "checkpoint.tw" as ckpt
 import "report.tw" as rep
+import "../twill_modules/twill/src/term/caps.tw" as cp
 
 let HOOK_RUN_BEGIN = 0
 let HOOK_EPOCH_BEGIN = 1
@@ -561,7 +562,7 @@ fn fire_log(c: Callback, r: st.Run, hook: I64) {
     if c.json {
       print(rep.epoch_json(r.st))
     } else {
-      print(rep.epoch_line(r.st))
+      print(rep.epoch_line(r.st, cp.detect()))
     }
     return
   }
@@ -577,14 +578,14 @@ fn fire_progress(c: Callback, r: st.Run, hook: I64) {
   if hook == HOOK_BATCH_END and c.batch_every > 0 {
     if r.st.batch % c.batch_every == 0 {
       print(rep.epoch_label(r.st.epoch + 1, r.st.epochs) + "  "
-        + rep.bar(r.st.batch + 1, r.st.batches, c.bar_width)
+        + rep.bar(r.st.batch + 1, r.st.batches, c.bar_width, cp.detect())
         + "  loss " + rep.fixed(r.st.train_loss, 4))
     }
     return
   }
   if hook == HOOK_EPOCH_END {
     print(rep.epoch_label(r.st.epoch, r.st.epochs) + "  "
-      + rep.bar(r.st.epoch, r.st.epochs, c.bar_width)
+      + rep.bar(r.st.epoch, r.st.epochs, c.bar_width, cp.detect())
       + "  loss " + rep.fixed(r.st.train_loss, 4))
   }
 }

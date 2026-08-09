@@ -147,22 +147,26 @@ logical shift so the helper can be deleted, not a change of semantics.
 
 ### 8. twill's terminal layer, reachable from a package
 
-**Needs:** `src/term/` and `src/cli/` available as `std/` modules, or an
-equivalent
-**Used by:** `src/report.tw`, which would call them and does not
-**Status:** they exist, in the twill repository, as files.
+**Needs:** `src/term/` and `src/cli/` reachable from a package
+**Used by:** `src/report.tw`, which now calls them
+**Status:** RESOLVED for colour and capability detection. The stateful bar is
+still deliberately not adopted; see below.
 
-twill resolves a non-`std/` import as a path relative to the importing file, so
-only modules under `std/` are reachable from an installed package. `src/term/`
-is not one. loom therefore has no colour, no capability detection, no width
-handling, and no progress bar, and prints one plain line per epoch instead.
+The resolution was not the one predicted here. Rather than promoting parts of
+the terminal layer into `std/`, twill made its `src/term/` and `src/cli/`
+modules import each other by a path relative to the importer, and
+`resolveImport` tries that path first. So a package that vendors twill under
+`twill_modules/` reaches the whole terminal layer, exactly the way weft reaches
+`chart` and bobbin reaches `box`. loom now detects capabilities and lights the
+loss value and the bar's fill, dropping to plain text the moment the output is
+piped.
 
-The right fix is not to widen the import rule. It is to promote the parts of the
-terminal layer that a library legitimately needs into `std/term`: capability
-detection, the palette, and the determinate bar. loom will delete
-`src/report.tw`'s formatting helpers the day that exists. Duplicating
-`src/cli/progress.tw` here was the obvious alternative and was rejected: two
-progress bars in one ecosystem drift, and the drift is visible to users.
+What loom still does not take is `src/cli/progress.tw`'s determinate bar with
+its rate and ETA. That bar is stateful and reads a clock, and wiring it in means
+threading a time source through the trainer, which is a separate change with its
+own correctness surface. Until then loom keeps its own stateless per-epoch bar,
+now lit from the same palette so the two never drift in colour. Duplicating the
+progress *logic* is still rejected for the reason it always was.
 
 ### 9. `f64` and `i64` conversions, and `F64` as a declared type
 

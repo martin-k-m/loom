@@ -2,6 +2,32 @@ mode systems
 
 import "harness.tw" as t
 import "../src/report.tw" as rep
+import "../twill_modules/twill/src/term/caps.tw" as cp
+
+# A terminal that cannot colour or draw box glyphs: the plain reading the tests
+# pin, so an assertion never depends on the machine that ran it.
+fn plain_caps() -> cp.Caps = cp.Caps {
+  level: cp.LEVEL_PLAIN, tty: false, width: 80, height: 24,
+  hyperlinks: false, unicode: false, animate: false,
+}
+
+# A terminal that can, so ansi.paint actually emits escapes.
+fn colour_caps() -> cp.Caps = cp.Caps {
+  level: cp.LEVEL_TRUECOLOR, tty: true, width: 80, height: 24,
+  hyperlinks: false, unicode: true, animate: false,
+}
+
+fn index_of(hay: Str, needle: Str) -> I64 {
+  let n = len(needle)
+  let i = 0
+  while i + n <= len(hay) {
+    if hay[i:i + n] == needle {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
 
 fn a_fixed_decimal_keeps_its_width() {
   t.equal_str("a whole number", rep.fixed(1.0, 4), "1.0000")
@@ -32,13 +58,22 @@ fn an_epoch_label_does_not_shift_when_the_count_crosses_a_decade() {
 }
 
 fn a_bar_fills_in_proportion() {
-  t.equal_str("empty", rep.bar(0, 10, 10), "[..........]")
-  t.equal_str("half", rep.bar(5, 10, 10), "[#####.....]")
-  t.equal_str("full", rep.bar(10, 10, 10), "[##########]")
+  t.equal_str("empty", rep.bar(0, 10, 10, plain_caps()), "[..........]")
+  t.equal_str("half", rep.bar(5, 10, 10, plain_caps()), "[#####.....]")
+  t.equal_str("full", rep.bar(10, 10, 10, plain_caps()), "[##########]")
 }
 
 fn a_bar_with_no_total_is_blank_rather_than_full() {
-  t.equal_str("no total", rep.bar(3, 0, 4), "[    ]")
+  t.equal_str("no total", rep.bar(3, 0, 4, plain_caps()), "[    ]")
+}
+
+fn a_bar_is_lit_when_the_terminal_can_colour() {
+  let lit = rep.bar(5, 10, 10, colour_caps())
+  let bare = rep.bar(5, 10, 10, plain_caps())
+  # The colour terminal emits an escape byte; the plain one never does, so a
+  # redirected training log stays the same bare columns it always was.
+  t.check("a colour terminal lights the fill", index_of(lit, chr(27)) >= 0)
+  t.check("a plain terminal leaves it bare", index_of(bare, chr(27)) < 0)
 }
 
 a_fixed_decimal_keeps_its_width()
@@ -48,4 +83,5 @@ a_negative_keeps_its_sign_and_its_magnitude()
 an_epoch_label_does_not_shift_when_the_count_crosses_a_decade()
 a_bar_fills_in_proportion()
 a_bar_with_no_total_is_blank_rather_than_full()
+a_bar_is_lit_when_the_terminal_can_colour()
 t.report("report")
