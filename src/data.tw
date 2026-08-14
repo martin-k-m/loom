@@ -37,7 +37,7 @@ fn batch_count(n: I64, batch_size: I64) -> I64 {
   if batch_size <= 0 {
     return 0
   }
-  (n + batch_size - 1) / batch_size
+  (n + batch_size - 1) // batch_size
 }
 
 fn batch_end(n: I64, batch_size: I64, b: I64) -> I64 {

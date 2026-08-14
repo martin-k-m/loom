@@ -19,9 +19,9 @@ mode systems
 
 import "state.tw" as st
 import "metrics.tw" as met
-import "../twill_modules/twill/src/term/caps.tw" as cp
-import "../twill_modules/twill/src/term/ansi.tw" as ansi
-import "../twill_modules/twill/src/cli/theme.tw" as th
+import "std/term/caps" as cp
+import "std/term/ansi" as ansi
+import "std/term/theme" as th
 
 # A fixed-width decimal. `str` on an F64 prints a shortest round-trip form,
 # which is right for a value being read back and wrong for a column of losses,

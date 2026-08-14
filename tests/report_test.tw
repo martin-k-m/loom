@@ -2,7 +2,7 @@ mode systems
 
 import "harness.tw" as t
 import "../src/report.tw" as rep
-import "../twill_modules/twill/src/term/caps.tw" as cp
+import "std/term/caps" as cp
 
 # A terminal that cannot colour or draw box glyphs: the plain reading the tests
 # pin, so an assertion never depends on the machine that ran it.

@@ -78,7 +78,7 @@ import "state.tw" as st
 import "metrics.tw" as met
 import "checkpoint.tw" as ckpt
 import "report.tw" as rep
-import "../twill_modules/twill/src/term/caps.tw" as cp
+import "std/term/caps" as cp
 
 let HOOK_RUN_BEGIN = 0
 let HOOK_EPOCH_BEGIN = 1
