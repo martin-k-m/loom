@@ -15,10 +15,13 @@ mode systems
 #                    too and the matmuls that move the memory run narrow.
 #                    Inside each kernel the accumulation is f32 by twill's
 #                    accumulation rule; loom does nothing to get that.
-#   gradients        f32, always. twill's autodiff allocates every cotangent
-#                    at grad_dtype(dtype), which is f32 for anything narrower,
-#                    so the optimiser sees f32 gradients without loom lifting
-#                    a finger.
+#   gradients        f32, always, and `mixed_step` casts them there itself.
+#                    This used to say twill's autodiff allocates each cotangent
+#                    at grad_dtype of the forward dtype, so loom got f32 for
+#                    free. It does not: autodiff hands back f64 whatever the
+#                    forward pass ran in, which is the right default for the
+#                    master weights and wrong for the overflow guard, because
+#                    nothing overflows f64 at any scale worth using.
 #   optimiser state  f32, because the moments are trees shaped like the
 #                    masters.
 #
@@ -204,7 +207,22 @@ fn mixed_step(pol: Policy, params: Tree, opt: st.OptState, x: Tensor, y: Tensor,
   # scheme: the cast's vjp hands each gradient back at the master's dtype,
   # f32, and the optimiser below updates the f32 masters directly.
   let vg = value_and_grad(fn(p) = loss_fn(narrow_tree(pol, p), xn, y) * s)(params)
-  let g = vg[1]
+
+  # The cotangents are put at f32 before anything else looks at them.
+  #
+  # The header above says gradients are f32 always, and says twill's autodiff
+  # allocates each cotangent at grad_dtype of the forward dtype so that loom
+  # gets it for free. That is not what twill does: autodiff hands back f64
+  # whatever the forward pass ran in. The claim was never checked because
+  # nothing downstream could tell the difference -- until it mattered here,
+  # where the whole point is that a scaled cotangent can overflow.
+  #
+  # In f64 nothing overflows at any plausible scale, so the scale-and-skip
+  # machinery below was unreachable: the scale would climb forever and never
+  # find its ceiling, which is the one thing a loss scale exists to do. f32 is
+  # both what the header promises and what makes the guard real, and it is the
+  # width a real mixed-precision gradient buffer has.
+  let g = map_leaves(fn(t) = t.to(f32), vg[1])
   if not grads_finite(leaves_of(g)) {
     # The step is SKIPPED, not clipped, and the skip is the load-bearing
     # behaviour of this whole file. Clipping an infinity to a large finite
