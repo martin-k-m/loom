@@ -25,11 +25,9 @@ mode systems
 # base + epoch to a generator directly would give epoch 8 and epoch 9 highly
 # correlated streams. The multiply-xorshift-multiply here is splitmix64's
 # finaliser, which decorrelates them.
-let MIX_A = 6364136223846793005
-let MIX_B = -4658895280553007687
-let MIX_C = -7723592293110705685
+import "std/hash" as sha
 
-let SIGN_BIT: I64 = shl(1, 63)
+
 
 # Logical right shift, because `shr` on `I64` is arithmetic: see the operators
 # section of twill's docs/language-guide.md. splitmix64's finaliser shifts a
@@ -38,31 +36,45 @@ let SIGN_BIT: I64 = shl(1, 63)
 # the reference silently. Clearing the sign bit before the shift and putting it
 # back at its shifted position is the same construction as twill's
 # `src/float.tw` `ushr`, which exists for the same reason.
-fn ushr(x: I64, k: I64) -> I64 {
-  if k == 0 { return x }
-  if x >= 0 { return shr(x, k) }
-  or(shr(and(x, bnot(SIGN_BIT)), k), shl(1, 63 - k))
+# The mixer is SHA-256, from twill's std/hash, and not the splitmix64 finaliser
+# this file used to carry.
+#
+# splitmix64 is three 64-bit multiplies, and an I64 here is held in an F64, so
+# it carries 53 bits: every multiply overflowed into the rounding and the mixer
+# returned a saturated constant. Adjacent epochs then got the same seed, which
+# is the one thing a seed deriver must not do, and it did it silently. See
+# twill's NEEDS-2.
+#
+# A cryptographic hash is far more than this needs, and that is fine: seeds are
+# derived a handful of times per run, not per draw.
+
+# 52 bits taken off the front of the digest: thirteen hex digits, four bits
+# each, which is inside the 53 an I64 represents exactly. Always non-negative,
+# which is what `seed()` requires.
+fn seed_from(s: Str) -> I64 {
+  let d: Str = sha.hash_str(s)
+  let out: I64 = 0
+  let i: I64 = 0
+  while i < 13 {
+    out = out * 16 + hex_value(d[i])
+    i = i + 1
+  }
+  out
 }
 
-fn mix(x: I64) -> I64 {
-  let z = x
-  z = xor(z, ushr(z, 30))
-  z = z * MIX_B
-  z = xor(z, ushr(z, 27))
-  z = z * MIX_C
-  z = xor(z, ushr(z, 31))
-  z
+fn hex_value(b: I64) -> I64 {
+  if b >= 97 { return b - 87 }
+  b - 48
 }
+
+# Kept for callers that want a scrambled integer from an integer. It is no
+# longer splitmix64's finaliser and no longer agrees with it.
+fn mix(x: I64) -> I64 = seed_from(str(x))
 
 # The seed epoch `epoch` runs under. Deterministic in (base, epoch) alone, so
 # it survives a resume and does not depend on how the run got here.
-fn epoch_seed(base: I64, epoch: I64) -> I64 {
-  let s = mix(base + MIX_A * (epoch + 1))
-  # seed() takes a non-negative value, and the mix produces the full signed
-  # range. Masking off the sign bit is a bijection on the low 63 bits, so it
-  # does not collapse two epochs onto one seed.
-  and(s, 9223372036854775807)
-}
+fn epoch_seed(base: I64, epoch: I64) -> I64 =
+  seed_from(str(base) + ":epoch:" + str(epoch))
 
 # Called by the trainer at the top of each epoch, before any shuffling.
 fn begin_epoch(base: I64, epoch: I64) {
@@ -72,16 +84,7 @@ fn begin_epoch(base: I64, epoch: I64) {
 # A seed for a purpose that is not an epoch: a train/test split, an
 # initialisation, a data augmentation stream. `tag` separates them, so a split
 # and an init derived from the same base seed do not draw the same numbers.
-fn derive(base: I64, tag: Str) -> I64 {
-  let h = 1469598103934665603
-  let i = 0
-  while i < len(tag) {
-    h = xor(h, tag[i])
-    h = h * 1099511628211
-    i = i + 1
-  }
-  and(mix(base + h), 9223372036854775807)
-}
+fn derive(base: I64, tag: Str) -> I64 = seed_from(str(base) + ":" + tag)
 
 # Initialise a model's parameters under a derived seed rather than the ambient
 # one, so that changing the number of epochs does not change the starting
