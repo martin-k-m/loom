@@ -139,6 +139,13 @@ fn narrow_tree(pol: Policy, master: Tree) -> Tree =
 # pushes each leaf and returns it unchanged. It works because arrays are
 # captured by reference. A leaves() builtin would delete both functions;
 # docs/needs.md entry 19.
+# Every gradient a real number: no NaN and no infinity. This is the check a loss
+# scale is raised against -- the step that overflowed has to be detected and
+# dropped -- and it cannot be written in twill, because a NaN compares false
+# against everything including itself. `all_finite` is the builtin that answers
+# it; this names it for what this file uses it for.
+fn grads_finite(ts: Arr[Tensor]) -> Bool = all_finite(ts)
+
 fn keep(out: Arr[Tensor], t: Tensor) -> Tensor {
   push(out, t)
   t

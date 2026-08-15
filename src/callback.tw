@@ -470,7 +470,7 @@ fn lr_at(c: Callback, epoch: I64) -> F64 {
     return c.base_lr * f64(epoch + 1) / f64(c.warmup + 1)
   }
   if c.sched == SCHED_STEP {
-    let drops = epoch / c.step_size
+    let drops = epoch // c.step_size
     let lr = c.base_lr
     let i = 0
     while i < drops {
@@ -619,7 +619,7 @@ fn pack_state(cbs: Arr[Callback]) -> Arr[F64] {
 
 fn unpack_state(cbs: Arr[Callback], packed: Arr[F64]) -> Str {
   if len(packed) != len(cbs) * PACK_STRIDE {
-    return "checkpoint holds state for " + str(len(packed) / PACK_STRIDE)
+    return "checkpoint holds state for " + str(len(packed) // PACK_STRIDE)
       + " callbacks and this run registers " + str(len(cbs))
   }
   let i = 0

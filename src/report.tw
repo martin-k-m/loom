@@ -128,7 +128,7 @@ fn bar(done: I64, total: I64, width: I64, caps: cp.Caps) -> Str {
   if total <= 0 {
     return ansi.paint(caps, th.muted(), "[" + pad_right("", width) + "]")
   }
-  let filled = done * width / total
+  let filled = done * width // total
   # A solid block reads as a fill where the terminal can draw it; the ASCII
   # hash is the same shape in a font that cannot. The fill is mint, twill's
   # colour for progress and structure, and the track is left quiet behind it.
