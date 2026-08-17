@@ -1,11 +1,11 @@
 <p align="center">
-  <img alt="twill" src="https://raw.githubusercontent.com/martin-k-m/twill/main/assets/twill-mark.png" width="120">
+  <img alt="twill" src="https://raw.githubusercontent.com/twill-lang/twill/main/assets/twill-mark.png" width="120">
 </p>
 
 <h1 align="center">loom</h1>
 
 <p align="center">
-  <b>The training framework for <a href="https://github.com/martin-k-m/twill">twill</a>.</b><br>
+  <b>The training framework for <a href="https://github.com/twill-lang/twill">twill</a>.</b><br>
   Written in twill.
 </p>
 
@@ -306,7 +306,7 @@ and the drift is visible to users.
 Once spool and `mode systems` both work:
 
 ```
-spool add loom https://github.com/martin-k-m/loom
+spool add loom https://github.com/twill-lang/loom
 ```
 
 spool vendors into `twill_modules/`, and twill's import is a path, so the import
