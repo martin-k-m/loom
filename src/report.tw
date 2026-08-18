@@ -22,6 +22,7 @@ import "metrics.tw" as met
 import "std/term/caps" as cp
 import "std/term/ansi" as ansi
 import "std/term/theme" as th
+import "std/json" as json
 
 # A fixed-width decimal. `str` on an F64 prints a shortest round-trip form,
 # which is right for a value being read back and wrong for a column of losses,
@@ -106,19 +107,36 @@ fn epoch_line(s: st.State, caps: cp.Caps) -> Str {
 # One JSON object per line. Machine-readable output is a separate function
 # rather than a flag on the human one, because a format that is sometimes
 # parseable is a format nothing parses.
+#
+# Built through std/json rather than concatenated. Three things that buys, in
+# the order they matter:
+#
+# - The metric name is escaped. It was interpolated straight into a quoted
+#   string here, so a metric registered as `f1"score` emitted a line no parser
+#   would accept, and the run that produced it looked fine until something read
+#   the log. Nothing in loom names a metric that way, and nothing in loom
+#   controls what a caller names one.
+# - The render walks a Bytes, so the document is built in linear time instead of
+#   copying the whole prefix per field. A per-epoch line is small enough that
+#   this is not why the change was made, and it is still the right shape.
+# - Field order is insertion order, which std/json guarantees, so the columns
+#   are the same on every line of a run and diffing two runs' logs lines up.
+#   That was the property the hand-rolled version had by construction and it is
+#   the one a Dict could quietly have taken away.
 fn epoch_json(s: st.State) -> Str {
-  let out = "{\"epoch\":" + str(s.epoch)
-    + ",\"epochs\":" + str(s.epochs)
-    + ",\"global_step\":" + str(s.global_step)
-    + ",\"lr\":" + str(s.lr)
-    + ",\"train_loss\":" + str(s.train_loss)
+  let doc = json.object()
+  json.set_field(doc, "epoch", json.number(f64(s.epoch)))
+  json.set_field(doc, "epochs", json.number(f64(s.epochs)))
+  json.set_field(doc, "global_step", json.number(f64(s.global_step)))
+  json.set_field(doc, "lr", json.number(s.lr))
+  json.set_field(doc, "train_loss", json.number(s.train_loss))
   let i = 0
   while i < len(s.val.names) {
-    out = out + ",\"val_" + s.val.names[i] + "\":"
-      + str(met.value_named(s.val, s.val.names[i]))
+    let name = s.val.names[i]
+    json.set_field(doc, "val_" + name, json.number(met.value_named(s.val, name)))
     i = i + 1
   }
-  out + "}"
+  json.render(doc)
 }
 
 # A textual progress indication, printed once per epoch. It is a fill without a

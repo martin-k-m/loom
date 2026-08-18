@@ -67,12 +67,20 @@ mode systems
 # ============================================================================
 #
 # One flat struct with a `kind` discriminant and the union of every callback's
-# fields. This is not the design anyone wants. With sum types it would be an
-# enum with a payload per variant and `fire` would be a match the checker
-# proves exhaustive; with function values in struct fields it would be a record
-# of closures. Neither is available (docs/needs.md entries 3 and 5), and a flat
-# struct is at least honest about it: every field is visible, and the fields a
-# given kind ignores are ignored in one place, in `fire`.
+# fields. The discriminant is now a real enum, `Kind`, so `fire` is a match the
+# checker proves exhaustive: adding a sixth kind is a compile error in every
+# function that dispatches on it, which is what the five-branch if-ladder this
+# replaced could not say. Before twill 1.6 it was an I64 and a run-off-the-end
+# fallthrough.
+#
+# The fields are still a flat union rather than a payload per case, and that is
+# deliberate rather than pending. A case carries one payload, so a payload-per-
+# case Kind means five more structs and five more constructors to reach a field
+# that `blank` already sets once; and the checkpoint packs callback state
+# positionally, which wants a fixed field set and not a shape that varies with
+# the case. What the enum buys is the dispatch, which is where the bug was.
+# Function values in struct fields would still be a better shape for the whole
+# file (docs/needs.md entry 3) and are still not available.
 
 import "state.tw" as st
 import "metrics.tw" as met
@@ -99,21 +107,38 @@ let ORDER_CHECKPOINT = 30
 let ORDER_LOG = 40
 let ORDER_PROGRESS = 50
 
-let KIND_SCHEDULE = 1
-let KIND_EARLY_STOP = 2
-let KIND_CHECKPOINT = 3
-let KIND_LOG = 4
-let KIND_PROGRESS = 5
+enum Kind { Schedule, EarlyStop, Checkpoint, Log, Progress }
+
+# The integer each kind is written as in a checkpoint, and the only place the
+# on-disk numbering is spelled. It matches the KIND_ constants this enum
+# replaced, so checkpoints written by earlier loom still restore. Changing a
+# number here changes the wire format; adding a case means adding a number, and
+# the match will say so.
+fn kind_code(k: Kind) -> I64 {
+  match k {
+    Schedule => 1,
+    EarlyStop => 2,
+    Checkpoint => 3,
+    Log => 4,
+    Progress => 5,
+  }
+}
+
+fn kind_name(k: Kind) -> Str {
+  match k {
+    Schedule => "schedule",
+    EarlyStop => "early_stop",
+    Checkpoint => "checkpoint",
+    Log => "log",
+    Progress => "progress",
+  }
+}
 
 # Schedule shapes.
-let SCHED_CONST = 0
-let SCHED_STEP = 1
-let SCHED_EXP = 2
-let SCHED_COSINE = 3
-let SCHED_PLATEAU = 4
+enum Sched { Const, Step, Exp, Cosine, Plateau }
 
 struct Callback {
-  kind: I64,
+  kind: Kind,
   name: Str,
   order: I64,
 
@@ -143,7 +168,7 @@ struct Callback {
   best_only: Bool,
 
   # Schedule.
-  sched: I64,
+  sched: Sched,
   base_lr: F64,
   factor: F64,
   step_size: I64,
@@ -157,13 +182,13 @@ struct Callback {
   batch_every: I64,
 }
 
-fn blank(kind: I64, name: Str, order: I64) -> Callback {
+fn blank(kind: Kind, name: Str, order: I64) -> Callback {
   Callback {
     kind: kind, name: name, order: order,
     monitor: "loss", higher_is_better: false, min_delta: 0.0,
     patience: 0, wait: 0, best: 0.0, best_epoch: 0, seen: false, improved: false,
     path: "", best_path: "", every: 1, best_only: false,
-    sched: SCHED_CONST, base_lr: 0.0, factor: 1.0, step_size: 1,
+    sched: Const, base_lr: 0.0, factor: 1.0, step_size: 1,
     min_lr: 0.0, warmup: 0, horizon: 0,
     json: false, bar_width: 24, batch_every: 0,
   }
@@ -176,7 +201,7 @@ fn blank(kind: I64, name: Str, order: I64) -> Callback {
 # Config.eval_every of 2, a patience of 3 is six epochs, and saying so here is
 # cheaper than the surprise later.
 fn early_stopping(monitor: Str, higher_is_better: Bool, patience: I64, min_delta: F64) -> Callback {
-  let c = blank(KIND_EARLY_STOP, "early_stopping", ORDER_EARLY_STOP)
+  let c = blank(EarlyStop, "early_stopping", ORDER_EARLY_STOP)
   c.monitor = monitor
   c.higher_is_better = higher_is_better
   c.patience = patience
@@ -190,7 +215,7 @@ fn early_stopping(monitor: Str, higher_is_better: Bool, patience: I64, min_delta
 # different files on purpose: the best epoch's optimiser state is not the state
 # training should continue from once training has moved past it.
 fn checkpointing(path: Str, every: I64, best_only: Bool, monitor: Str, higher_is_better: Bool) -> Callback {
-  let c = blank(KIND_CHECKPOINT, "checkpoint", ORDER_CHECKPOINT)
+  let c = blank(Checkpoint, "checkpoint", ORDER_CHECKPOINT)
   c.path = path
   c.best_path = path + ".best"
   c.every = every
@@ -202,8 +227,8 @@ fn checkpointing(path: Str, every: I64, best_only: Bool, monitor: Str, higher_is
 
 # Multiply the rate by `factor` every `step_size` epochs.
 fn step_lr(base_lr: F64, factor: F64, step_size: I64) -> Callback {
-  let c = blank(KIND_SCHEDULE, "step_lr", ORDER_SCHEDULE)
-  c.sched = SCHED_STEP
+  let c = blank(Schedule, "step_lr", ORDER_SCHEDULE)
+  c.sched = Step
   c.base_lr = base_lr
   c.factor = factor
   c.step_size = step_size
@@ -211,8 +236,8 @@ fn step_lr(base_lr: F64, factor: F64, step_size: I64) -> Callback {
 }
 
 fn exp_lr(base_lr: F64, factor: F64) -> Callback {
-  let c = blank(KIND_SCHEDULE, "exp_lr", ORDER_SCHEDULE)
-  c.sched = SCHED_EXP
+  let c = blank(Schedule, "exp_lr", ORDER_SCHEDULE)
+  c.sched = Exp
   c.base_lr = base_lr
   c.factor = factor
   c
@@ -223,8 +248,8 @@ fn exp_lr(base_lr: F64, factor: F64) -> Callback {
 # from min_lr because the point of it is that the first updates, taken while
 # adam's second moment estimate is built from one or two batches, are small.
 fn cosine_lr(base_lr: F64, min_lr: F64, horizon: I64, warmup: I64) -> Callback {
-  let c = blank(KIND_SCHEDULE, "cosine_lr", ORDER_SCHEDULE)
-  c.sched = SCHED_COSINE
+  let c = blank(Schedule, "cosine_lr", ORDER_SCHEDULE)
+  c.sched = Cosine
   c.base_lr = base_lr
   c.min_lr = min_lr
   c.horizon = horizon
@@ -238,8 +263,8 @@ fn cosine_lr(base_lr: F64, min_lr: F64, horizon: I64, warmup: I64) -> Callback {
 # construction: a callback cannot both act on this epoch's metric and set the
 # rate this epoch trains at.
 fn plateau_lr(monitor: Str, higher_is_better: Bool, factor: F64, patience: I64, min_lr: F64) -> Callback {
-  let c = blank(KIND_SCHEDULE, "plateau_lr", ORDER_SCHEDULE)
-  c.sched = SCHED_PLATEAU
+  let c = blank(Schedule, "plateau_lr", ORDER_SCHEDULE)
+  c.sched = Plateau
   c.monitor = monitor
   c.higher_is_better = higher_is_better
   c.factor = factor
@@ -249,13 +274,13 @@ fn plateau_lr(monitor: Str, higher_is_better: Bool, factor: F64, patience: I64, 
 }
 
 fn metric_log(json: Bool) -> Callback {
-  let c = blank(KIND_LOG, "metric_log", ORDER_LOG)
+  let c = blank(Log, "metric_log", ORDER_LOG)
   c.json = json
   c
 }
 
 fn progress(bar_width: I64, batch_every: I64) -> Callback {
-  let c = blank(KIND_PROGRESS, "progress", ORDER_PROGRESS)
+  let c = blank(Progress, "progress", ORDER_PROGRESS)
   c.bar_width = bar_width
   c.batch_every = batch_every
   c
@@ -291,11 +316,14 @@ fn validate(cbs: Arr[Callback]) -> Str {
   let i = 0
   while i < len(cbs) {
     let c = cbs[i]
-    if c.kind == KIND_SCHEDULE {
-      schedules = schedules + 1
-    }
-    if c.kind == KIND_EARLY_STOP {
-      stoppers = stoppers + 1
+    match c.kind {
+      Schedule => schedules = schedules + 1,
+      EarlyStop => stoppers = stoppers + 1,
+      # The three that write nothing another callback reads, so nothing here
+      # constrains how many of them a run registers.
+      Checkpoint => unit,
+      Log => unit,
+      Progress => unit,
     }
     if c.order < ORDER_SCHEDULE or c.order > ORDER_PROGRESS {
       return "callback " + c.name + " has order " + str(c.order)
@@ -397,24 +425,15 @@ fn observe(c: Callback, r: st.Run) {
 
 fn fire(cbs: Arr[Callback], at: I64, r: st.Run, hook: I64) {
   let c = cbs[at]
-  if c.kind == KIND_SCHEDULE {
-    fire_schedule(c, r, hook)
-    return
-  }
-  if c.kind == KIND_EARLY_STOP {
-    fire_early_stop(c, r, hook)
-    return
-  }
-  if c.kind == KIND_CHECKPOINT {
-    fire_checkpoint(c, cbs, r, hook)
-    return
-  }
-  if c.kind == KIND_LOG {
-    fire_log(c, r, hook)
-    return
-  }
-  if c.kind == KIND_PROGRESS {
-    fire_progress(c, r, hook)
+  # The dispatch, and the reason Kind is an enum. As an if-ladder this fell off
+  # the end silently for a kind nobody had written a branch for; here the
+  # checker names the missing arm.
+  match c.kind {
+    Schedule => fire_schedule(c, r, hook),
+    EarlyStop => fire_early_stop(c, r, hook),
+    Checkpoint => fire_checkpoint(c, cbs, r, hook),
+    Log => fire_log(c, r, hook),
+    Progress => fire_progress(c, r, hook),
   }
 }
 
@@ -423,7 +442,7 @@ fn fire_schedule(c: Callback, r: st.Run, hook: I64) {
     if c.base_lr == 0.0 {
       c.base_lr = r.cfg.lr
     }
-    if c.sched == SCHED_PLATEAU {
+    if c.sched == Plateau {
       # A plateau schedule carries the rate itself, so a resumed run keeps the
       # cuts it had already made rather than starting from base_lr again.
       if r.st.lr > 0.0 {
@@ -433,7 +452,7 @@ fn fire_schedule(c: Callback, r: st.Run, hook: I64) {
       return
     }
   }
-  if hook == HOOK_EVAL_END and c.sched == SCHED_PLATEAU {
+  if hook == HOOK_EVAL_END and c.sched == Plateau {
     observe(c, r)
     # `wait > patience`, the same comparison early stopping uses. Two callbacks
     # in one framework disagreeing about what a patience of 2 means is exactly
@@ -460,47 +479,49 @@ fn fire_schedule(c: Callback, r: st.Run, hook: I64) {
 # resumed run computes the same rate the uninterrupted one would have, rather
 # than the rate it happens to have decayed to.
 fn lr_at(c: Callback, epoch: I64) -> F64 {
-  if c.sched == SCHED_CONST {
-    return c.base_lr
-  }
-  if c.sched == SCHED_PLATEAU {
+  # Const and Plateau carry the rate rather than computing one, so they answer
+  # before the warmup ramp: warming up to a rate that is already the answer
+  # would make a resumed plateau run replay a ramp it has moved past. The three
+  # decaying shapes fall through to the match below, which is exhaustive, so
+  # they are named there a second time rather than left to a `_`.
+  if c.sched == Const or c.sched == Plateau {
     return c.base_lr
   }
   if epoch < c.warmup {
     return c.base_lr * f64(epoch + 1) / f64(c.warmup + 1)
   }
-  if c.sched == SCHED_STEP {
-    let drops = epoch // c.step_size
-    let lr = c.base_lr
-    let i = 0
-    while i < drops {
-      lr = lr * c.factor
-      i = i + 1
-    }
-    return clamp_lr(lr, c.min_lr)
+  match c.sched {
+    Step => clamp_lr(decayed(c.base_lr, c.factor, epoch // c.step_size), c.min_lr),
+    Exp => clamp_lr(decayed(c.base_lr, c.factor, epoch), c.min_lr),
+    Cosine => cosine_at(c, epoch),
+    Const => c.base_lr,
+    Plateau => c.base_lr,
   }
-  if c.sched == SCHED_EXP {
-    let lr = c.base_lr
-    let i = 0
-    while i < epoch {
-      lr = lr * c.factor
-      i = i + 1
-    }
-    return clamp_lr(lr, c.min_lr)
+}
+
+# `base * factor^n`, by repeated multiplication rather than pow. The two decays
+# differ only in what they count, so counting is the parameter.
+fn decayed(base: F64, factor: F64, n: I64) -> F64 {
+  let lr = base
+  let i = 0
+  while i < n {
+    lr = lr * factor
+    i = i + 1
   }
-  if c.sched == SCHED_COSINE {
-    let span = c.horizon - c.warmup
-    if span <= 0 {
-      return c.base_lr
-    }
-    let t = f64(epoch - c.warmup) / f64(span)
-    if t > 1.0 {
-      t = 1.0
-    }
-    let cosv = item(cos(scalar(3.14159265358979 * t)))
-    return c.min_lr + (c.base_lr - c.min_lr) * 0.5 * (1.0 + cosv)
+  lr
+}
+
+fn cosine_at(c: Callback, epoch: I64) -> F64 {
+  let span = c.horizon - c.warmup
+  if span <= 0 {
+    return c.base_lr
   }
-  c.base_lr
+  let t = f64(epoch - c.warmup) / f64(span)
+  if t > 1.0 {
+    t = 1.0
+  }
+  let cosv = item(cos(scalar(3.14159265358979 * t)))
+  c.min_lr + (c.base_lr - c.min_lr) * 0.5 * (1.0 + cosv)
 }
 
 fn clamp_lr(lr: F64, min_lr: F64) -> F64 {
@@ -596,6 +617,12 @@ fn fire_progress(c: Callback, r: st.Run, hook: I64) {
 # Restoring into a differently ordered or differently sized list is refused
 # rather than misassigned, because a patience counter landing on the wrong
 # callback is invisible until it stops a run early.
+#
+# The kind is written as its `kind_code`, the same integer the KIND_ constants
+# held before Kind was an enum, so the packed array is byte-identical to what
+# earlier loom wrote and checkpoints round-trip across the change. The enum
+# lives on this side of the boundary and the integer stays on the disk side,
+# which is the only place the numbering is allowed to matter.
 let PACK_STRIDE = 5
 
 fn pack_state(cbs: Arr[Callback]) -> Arr[F64] {
@@ -603,7 +630,7 @@ fn pack_state(cbs: Arr[Callback]) -> Arr[F64] {
   let i = 0
   while i < len(cbs) {
     let c = cbs[i]
-    push(out, f64(c.kind))
+    push(out, f64(kind_code(c.kind)))
     push(out, f64(c.wait))
     push(out, c.best)
     push(out, f64(c.best_epoch))
@@ -625,9 +652,10 @@ fn unpack_state(cbs: Arr[Callback], packed: Arr[F64]) -> Str {
   let i = 0
   while i < len(cbs) {
     let base = i * PACK_STRIDE
-    if i64(packed[base]) != cbs[i].kind {
+    if i64(packed[base]) != kind_code(cbs[i].kind) {
       return "checkpoint callback " + str(i) + " is kind "
-        + str(i64(packed[base])) + " and this run has kind " + str(cbs[i].kind)
+        + str(i64(packed[base])) + " and this run has kind "
+        + kind_name(cbs[i].kind)
     }
     cbs[i].wait = i64(packed[base + 1])
     cbs[i].best = packed[base + 2]

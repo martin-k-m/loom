@@ -54,6 +54,13 @@ let FORMAT = 1
 struct Checkpoint {
   format: I64,
   params: Tree,
+  # The optimiser's kind as an integer, not as st.OptKind, and that is the
+  # point. This struct is what `save` writes to disk and `load` reads back, so
+  # its field types are the wire format. Storing the enum here would change the
+  # bytes and make every existing checkpoint unreadable for a cosmetic gain, so
+  # the integer stays and the conversion happens at this boundary: `build` calls
+  # st.opt_code on the way out and `restore` calls st.opt_of_code on the way in.
+  # FORMAT is unchanged at 1 because nothing about the file changed.
   opt_kind: I64,
   opt_m: Tree,
   opt_v: Tree,
@@ -82,7 +89,7 @@ fn build(r: st.Run, cb_state: Arr[F64], rows: I64, note: Str) -> Checkpoint {
   Checkpoint {
     format: FORMAT,
     params: r.params,
-    opt_kind: r.opt.kind,
+    opt_kind: st.opt_code(r.opt.kind),
     opt_m: r.opt.m,
     opt_v: r.opt.v,
     opt_t: r.opt.t,
@@ -110,14 +117,37 @@ fn write(r: st.Run, cb_state: Arr[F64], rows: I64, path: Str, note: Str) -> Str 
 
 fn read(path: Str) -> Checkpoint = load(path)
 
+# The stored code against the run's optimiser. Returns an error string, empty
+# when they agree. Split out of `restore` because a match is an expression and a
+# `return` does not sit in one. The parentheses on the None arm are load-bearing
+# in twill 1.6: an arm's expression cannot continue onto the next line with a
+# leading operator unless it is bracketed.
+fn opt_mismatch(stored: I64, running: st.OptKind) -> Str {
+  match st.opt_of_code(stored) {
+    Some(k) => opt_names_differ(k, running),
+    None => ("checkpoint holds optimiser kind " + str(stored)
+      + ", which this build of loom does not recognise"),
+  }
+}
+
+fn opt_names_differ(stored: st.OptKind, running: st.OptKind) -> Str {
+  if stored == running {
+    return ""
+  }
+  "checkpoint holds optimiser state for " + st.opt_name(stored)
+    + " and this run uses " + st.opt_name(running)
+}
+
 # Put a checkpoint back into a run. The run must already hold a model of the
 # right shape and a config; restore overwrites the parts a checkpoint owns and
 # leaves the rest, so changing the epoch count or the verbosity between runs
 # works and changing the seed does not silently take effect.
 #
-# Returns an error string, empty on success, following spool's convention: the
-# subset has no Res, so a fallible function that also mutates reports through
-# its return value.
+# Returns an error string, empty on success, following spool's convention.
+# twill 1.6 has `Res`, and this should be one; it is not yet because `restore`
+# mutates `r` and returns nothing on success, so the honest signature is
+# `Res[Unit, Str]`, and every fallible function in loom has the same shape and
+# has to move together with its tests. See docs/needs.md entry 4.
 fn restore(r: st.Run, c: Checkpoint, rows: I64) -> Str {
   if c.format != FORMAT {
     return "checkpoint format " + str(c.format) + " is not format " + str(FORMAT)
@@ -126,9 +156,13 @@ fn restore(r: st.Run, c: Checkpoint, rows: I64) -> Str {
     return "checkpoint was written over " + str(c.rows)
       + " rows and this dataset has " + str(rows)
   }
-  if c.opt_kind != r.opt.kind {
-    return "checkpoint holds optimiser state of kind " + str(c.opt_kind)
-      + " and this run uses kind " + str(r.opt.kind)
+  # Decoded, not compared as integers, so a code this build has no name for is
+  # reported as unrecognised rather than as a mismatch against a rule it might
+  # actually be. That is a file written by a newer loom, and the message should
+  # say so.
+  let opt_bad = opt_mismatch(c.opt_kind, r.opt.kind)
+  if len(opt_bad) > 0 {
+    return opt_bad
   }
   if c.seed != r.cfg.seed {
     # The seed is the run. Resuming under a different one produces a different

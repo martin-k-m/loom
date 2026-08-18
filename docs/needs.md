@@ -67,12 +67,16 @@ entry 5.
 **Used by:** `src/trainer.tw` (`fit` returns a run and an error),
 `src/checkpoint.tw` (`restore`), `src/callback.tw` (`validate`,
 `unpack_state`), `src/data.tw` (`take`, `split`)
-**Status:** `Res[T, E]` and `Opt[T]` are in section 1.2 of the self-hosting
-design and need generics; multiple returns are not designed anywhere.
+**Status:** `Res[T, E]`, `Opt[T]` and postfix `?` landed in twill 1.6. Multiple
+returns are still not designed anywhere, and loom has not yet moved onto `Res`.
 
 Every fallible function in loom returns a `Str` that is empty on success, which
 is spool's convention and has spool's problem: the compiler does not make anyone
-read it. Every function that wants to return two things returns a struct
+read it. That is now a choice rather than a constraint, and the reason it has
+not been made yet is that it is one change and not several: `fit`, `restore`,
+`validate`, `unpack_state`, `take` and `split` all have the shape, they call
+each other, and moving one without the rest means two conventions in one
+repository, which is worse than either. It is the next thing worth doing here. Every function that wants to return two things returns a struct
 declared for that one call site, which is why `src/data.tw` has a `Batch` and
 `src/state.tw` has a `StepResult`. Neither struct is a type anyone wanted; both
 are a tuple with a name.
@@ -81,21 +85,28 @@ are a tuple with a name.
 
 **Used by:** `src/callback.tw` (`Callback.kind`, `fire`), `src/state.tw`
 (`OptState.kind`), `src/callback.tw` (`Callback.sched`)
-**Status:** designed in section 1.2 of the self-hosting design, not implemented.
+**Status:** landed in twill 1.6, and loom uses it. Closed.
 
-`Callback` is one flat struct holding the union of every callback's fields with
-an I64 discriminant, and `fire` is an if-chain over it. Three discriminants in
-this repository are I64 constants: callback kind, optimiser kind, schedule
-shape. Every one of them wants to be an enum, and every one of them has the same
-failure mode: adding a variant compiles and silently does nothing, because
-nothing forces the if-chain to grow an arm. Exhaustive `match` is the feature
-that turns adding a callback from a hunt into a compile error, and a callback
-framework is exactly the kind of code that gets extended by people who did not
-write it.
+Four discriminants in this repository were I64 constants: callback kind,
+schedule shape, optimiser kind, and precision policy. All four are enums now,
+and every dispatch over them is an exhaustive `match`. What that bought, in each
+case, is that the if-chain's fallthrough is gone: `cb.fire` fell off the end for
+an unhandled kind, `tr.apply` fell through to adam, and `pre.narrow` fell
+through to no narrowing at all. Each of those is a run that trains and is not
+the run that was asked for.
 
-The workaround also costs correctness, not only tidiness: a checkpoint callback
-carries `patience` and `min_delta` fields it never reads, and nothing stops a
-caller setting them and expecting an effect.
+Two things are unchanged and are not waiting on anything. `Callback` is still
+one flat struct holding the union of every callback's fields, because a case
+carries one payload and the checkpoint packs callback state positionally, which
+wants a fixed field set. So the correctness cost named here still stands: a
+checkpoint callback carries `patience` and `min_delta` fields it never reads,
+and nothing stops a caller setting them and expecting an effect. That is entry 3
+(function values in struct fields), not this one.
+
+The two discriminants that reach a file on disk, `OptState.kind` and
+`Callback.kind`, are written as integers and converted at the boundary by
+`st.opt_code`/`st.opt_of_code` and `cb.kind_code`. The numbering is unchanged, so
+checkpoints written before this survive it.
 
 ### 6. Reading and restoring the generator position
 
@@ -209,12 +220,14 @@ copies of the same problem, which makes five in the ecosystem.
 ### 12. `Dict` values that are not scalars
 
 **Would improve:** `src/metrics.tw` (`MeterSet`)
-**Status:** milestone 1 gives `Dict[Str, V]`; whether `V` may be a struct is
-not stated.
+**Status:** a `Dict[Str, V]` does hold a struct in twill 1.6, and `MeterSet` is
+one `Dict[Str, Meter]` now. Closed.
 
-`MeterSet` is two parallel `Dict[Str, F64]` plus an `Arr[Str]` of names, where
-it wants to be one `Dict[Str, Meter]`. The parallel dicts can go out of step and
-only a convention keeps them together.
+`MeterSet` was two parallel `Dict[Str, F64]` plus an `Arr[Str]` of names, where
+it wanted to be one `Dict[Str, Meter]`. The parallel dicts could go out of step
+and only a convention kept them together. As one dict, `update_named` and
+`value_named` are the existing `update` and `value` rather than a second copy of
+the weighting rule this file exists to get right.
 
 The `Arr[Str]` stays regardless of this entry. Report column order has to be
 stable across runs and across machines, and depending on the dict's iteration
@@ -282,10 +295,14 @@ pass runs in, so `Policy` wants a `compute: Dtype` field and `narrow` wants
 `t.to(pol.compute)`. Neither is writable. The argument of `.to` is a position
 where a bare name is read as a dtype, not an expression evaluated to one, and
 even if it were, systems mode makes annotations mandatory and the type of a
-dtype value has no name. loom works around it the way `OptState.kind` works
-around entry 5: an I64 discriminant and an if-chain in `narrow` with each
-dtype name written out literally, with the same failure mode, since a new
-dtype in twill means finding every such chain by hand.
+dtype value has no name. loom works around it the way `OptState.kind` does: a
+discriminant, `Prec`, and one arm of `narrow` per case with each dtype name
+written out literally. Since twill 1.6 the discriminant is a real enum and the
+arms are an exhaustive `match`, so a case added to `Prec` and not handled here
+is a check-time error rather than a tensor that silently stays wide. That fixes
+loom's half of the failure mode and not twill's: a new dtype *in twill* still
+means finding every such chain by hand, because nothing connects the set of
+dtypes to the set of cases.
 
 Half of this landed after it was written: twill grew a `dtype(t)` builtin that
 returns a tensor's dtype as a name string, so the read direction exists and a

@@ -58,58 +58,58 @@ fn reset(m: Meter) {
   m.weight = 0.0
 }
 
-# A set of named meters. `names` is kept alongside the dicts because report
-# order has to be stable across runs and across machines, and insertion order
-# is a property of the dict this source should not have to depend on.
+# A set of named meters: one Meter per name, and the names in the order they
+# were first seen.
+#
+# This was two parallel dicts, `totals` and `weights`, which had to be written
+# to in lockstep by every function that touched either -- exactly the shape a
+# Meter already is, spelled twice. One `Dict[Str, Meter]` is the same data with
+# no way for the two halves to disagree, and it means `update_named` and
+# `value_named` are the existing `update` and `value` rather than a second copy
+# of the weighting rule this file exists to get right.
+#
+# `names` stays alongside the dict, and it is not redundant. Report order has to
+# be stable across runs and across machines, and insertion order is a property
+# of the dict this source should not depend on. Membership is asked of the dict
+# now rather than by scanning `names`, so the array is only ever read in order.
 struct MeterSet {
-  totals: Dict[Str, F64],
-  weights: Dict[Str, F64],
+  meters: Dict[Str, Meter],
   names: Arr[Str],
 }
 
 fn new_meters() -> MeterSet {
-  let t: Dict[Str, F64] = {}
-  let w: Dict[Str, F64] = {}
+  let m: Dict[Str, Meter] = {}
   let n: Arr[Str] = []
-  MeterSet { totals: t, weights: w, names: n }
+  MeterSet { meters: m, names: n }
 }
 
-fn has(ms: MeterSet, name: Str) -> Bool {
-  let i = 0
-  while i < len(ms.names) {
-    if ms.names[i] == name {
-      return true
-    }
-    i = i + 1
+fn has(ms: MeterSet, name: Str) -> Bool = dict_has(ms.meters, name)
+
+# The meter for `name`, creating it and recording the name on first sight. A
+# Meter is a handle, so the caller mutates the one in the dict.
+fn meter_named(ms: MeterSet, name: Str) -> Meter {
+  if not has(ms, name) {
+    push(ms.names, name)
+    ms.meters[name] = new_meter()
   }
-  false
+  ms.meters[name]
 }
 
 fn update_named(ms: MeterSet, name: Str, value: F64, count: I64) {
-  if not has(ms, name) {
-    push(ms.names, name)
-    ms.totals[name] = 0.0
-    ms.weights[name] = 0.0
-  }
-  ms.totals[name] = ms.totals[name] + value * f64(count)
-  ms.weights[name] = ms.weights[name] + f64(count)
+  update(meter_named(ms, name), value, count)
 }
 
 fn value_named(ms: MeterSet, name: Str) -> F64 {
   if not has(ms, name) {
     return 0.0
   }
-  if ms.weights[name] == 0.0 {
-    return 0.0
-  }
-  ms.totals[name] / ms.weights[name]
+  value(ms.meters[name])
 }
 
 fn reset_all(ms: MeterSet) {
   let i = 0
   while i < len(ms.names) {
-    ms.totals[ms.names[i]] = 0.0
-    ms.weights[ms.names[i]] = 0.0
+    reset(ms.meters[ms.names[i]])
     i = i + 1
   }
 }

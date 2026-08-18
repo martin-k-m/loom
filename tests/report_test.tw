@@ -3,6 +3,8 @@ mode systems
 import "harness.tw" as t
 import "../src/report.tw" as rep
 import "std/term/caps" as cp
+import "../src/state.tw" as st
+import "../src/metrics.tw" as met
 
 # A terminal that cannot colour or draw box glyphs: the plain reading the tests
 # pin, so an assertion never depends on the machine that ran it.
@@ -76,6 +78,28 @@ fn a_bar_is_lit_when_the_terminal_can_colour() {
   t.check("a plain terminal leaves it bare", index_of(bare, chr(27)) < 0)
 }
 
+# epoch_json had no test at all while it was built by string concatenation, and
+# the two properties worth pinning are the two that were easiest to lose in
+# moving it onto std/json: the field order, which a diff of two runs' logs
+# depends on, and the escaping, which the concatenated version did not do.
+fn a_json_line_keeps_its_fields_in_order() {
+  let s = st.new_state(st.config(20, 8, 0.025, 7))
+  s.epoch = 3
+  met.update_named(s.val, "loss", 0.5, 10)
+  met.update_named(s.val, "accuracy", 0.75, 10)
+  let line = rep.epoch_json(s)
+  t.check("epoch comes first", index_of(line, "{\"epoch\":3") == 0)
+  t.check("loss precedes accuracy",
+    index_of(line, "\"val_loss\"") < index_of(line, "\"val_accuracy\""))
+}
+
+fn a_metric_name_needing_escapes_still_parses() {
+  let s = st.new_state(st.config(1, 1, 0.1, 1))
+  met.update_named(s.val, "f1\"score", 0.5, 1)
+  # The quote inside the name is escaped rather than closing the JSON string.
+  t.check("the quote is escaped", index_of(rep.epoch_json(s), "val_f1\\\"score") >= 0)
+}
+
 a_fixed_decimal_keeps_its_width()
 a_fixed_decimal_rounds_rather_than_truncates()
 a_carry_out_of_the_fraction_reaches_the_integer_part()
@@ -84,4 +108,6 @@ an_epoch_label_does_not_shift_when_the_count_crosses_a_decade()
 a_bar_fills_in_proportion()
 a_bar_with_no_total_is_blank_rather_than_full()
 a_bar_is_lit_when_the_terminal_can_colour()
+a_json_line_keeps_its_fields_in_order()
+a_metric_name_needing_escapes_still_parses()
 t.report("report")

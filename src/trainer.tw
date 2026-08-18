@@ -46,7 +46,8 @@ import "std/optim" as optim
 # epoch zero.
 #
 # Returns an error string in the second position by writing it into the run's
-# stop_reason and returning it; the subset has no Res.
+# stop_reason and returning it. `Res` exists as of twill 1.6 and this wants to
+# be one; see docs/needs.md entry 4 for why loom has not moved yet.
 fn fit(r: st.Run, cbs_in: Arr[cb.Callback], train: dt.Dataset, val: dt.Dataset,
        step: fn(Tree, st.OptState, Tensor, Tensor, F64) -> st.StepResult,
        eval_batch: fn(Tree, Tensor, Tensor) -> met.MeterSet) -> Str {
@@ -191,17 +192,28 @@ fn default_step(params: Tree, opt: st.OptState, x: Tensor, y: Tensor, lr: F64,
 # clipping, accumulation over several batches, a second loss term) can reuse
 # the optimiser dispatch without reimplementing it.
 fn apply(params: Tree, g: Tree, opt: st.OptState, lr: F64, loss: F64) -> st.StepResult {
-  if opt.kind == st.OPT_SGD {
-    return st.StepResult { loss: loss, params: optim.sgd_step(params, g, lr), opt: opt }
+  # An exhaustive match rather than two ifs and a fallthrough. The fallthrough
+  # was adam, so a fourth optimiser added to OptKind would have been trained
+  # with adam's update rule and its own hyperparameters ignored, which produces
+  # a run that converges and is not the run that was asked for. Now it is a
+  # check-time error naming the missing arm.
+  match opt.kind {
+    st.Sgd => st.StepResult { loss: loss, params: optim.sgd_step(params, g, lr), opt: opt },
+    st.Momentum => momentum_apply(params, g, opt, lr, loss),
+    st.Adam => adam_apply(params, g, opt, lr, loss),
   }
-  if opt.kind == st.OPT_MOMENTUM {
-    let out = optim.momentum_step(params, g, opt.m, lr, opt.mu)
-    opt.m = out[1]
-    opt.t = opt.t + 1
-    return st.StepResult { loss: loss, params: out[0], opt: opt }
-  }
-  # adam. t is incremented before the step because std/optim expects a 1-based
-  # count: passing 0 makes the bias correction divide by zero.
+}
+
+fn momentum_apply(params: Tree, g: Tree, opt: st.OptState, lr: F64, loss: F64) -> st.StepResult {
+  let out = optim.momentum_step(params, g, opt.m, lr, opt.mu)
+  opt.m = out[1]
+  opt.t = opt.t + 1
+  st.StepResult { loss: loss, params: out[0], opt: opt }
+}
+
+# t is incremented before the step because std/optim expects a 1-based count:
+# passing 0 makes the bias correction divide by zero.
+fn adam_apply(params: Tree, g: Tree, opt: st.OptState, lr: F64, loss: F64) -> st.StepResult {
   opt.t = opt.t + 1
   let out = optim.adam_step(params, g, opt.m, opt.v, opt.t, lr, opt.b1, opt.b2, opt.eps)
   opt.m = out[1]

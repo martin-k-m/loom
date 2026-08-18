@@ -95,11 +95,52 @@ fn new_state(cfg: Config) -> State {
   }
 }
 
+# Which update rule an OptState holds moments for. Named OptKind rather than
+# Opt because `Opt[T]` is twill's option type and two things called Opt in one
+# file is a reader's problem before it is a checker's.
+enum OptKind { Sgd, Momentum, Adam }
+
+# The integer an OptKind is written as in a checkpoint, and the only place that
+# numbering is spelled. It matches the OPT_ constants this enum replaced, so
+# checkpoints written by earlier loom still restore. src/checkpoint.tw stores
+# the code and converts at the boundary; see the note there.
+fn opt_code(k: OptKind) -> I64 {
+  match k {
+    Sgd => 0,
+    Momentum => 1,
+    Adam => 2,
+  }
+}
+
+fn opt_name(k: OptKind) -> Str {
+  match k {
+    Sgd => "sgd",
+    Momentum => "momentum",
+    Adam => "adam",
+  }
+}
+
+# A code read back off disk. An unknown number is a checkpoint this build does
+# not understand, and None says so rather than guessing sgd, which would restore
+# adam's moments into a rule that ignores them and train something else.
+fn opt_of_code(n: I64) -> Opt[OptKind] {
+  if n == 0 {
+    return Some(Sgd)
+  }
+  if n == 1 {
+    return Some(Momentum)
+  }
+  if n == 2 {
+    return Some(Adam)
+  }
+  None
+}
+
 struct OptState {
-  # 0 sgd, 1 momentum, 2 adam. There are no sum types in the subset, so the
-  # discriminant is an I64 and the unused fields are ignored rather than
-  # absent. See docs/needs.md entry 3.
-  kind: I64,
+  # The update rule. The unused moment fields are ignored rather than absent:
+  # a case carries one payload, and splitting the moments per case would make
+  # the checkpoint's field set vary with the rule. See docs/needs.md entry 3.
+  kind: OptKind,
   # First and second moment trees for adam; `m` alone is the velocity for
   # momentum. Both are trees shaped like the parameters.
   m: Tree,
@@ -114,22 +155,18 @@ struct OptState {
   mu: F64,
 }
 
-let OPT_SGD = 0
-let OPT_MOMENTUM = 1
-let OPT_ADAM = 2
-
 fn sgd(params: Tree) -> OptState {
-  OptState { kind: OPT_SGD, m: params, v: params, t: 0,
+  OptState { kind: Sgd, m: params, v: params, t: 0,
              b1: 0.0, b2: 0.0, eps: 0.0, mu: 0.0 }
 }
 
 fn momentum(params: Tree, mu: F64) -> OptState {
-  OptState { kind: OPT_MOMENTUM, m: zeros_like_tree(params), v: params, t: 0,
+  OptState { kind: Momentum, m: zeros_like_tree(params), v: params, t: 0,
              b1: 0.0, b2: 0.0, eps: 0.0, mu: mu }
 }
 
 fn adam(params: Tree) -> OptState {
-  OptState { kind: OPT_ADAM, m: zeros_like_tree(params), v: zeros_like_tree(params),
+  OptState { kind: Adam, m: zeros_like_tree(params), v: zeros_like_tree(params),
              t: 0, b1: 0.9, b2: 0.999, eps: 0.00000001, mu: 0.0 }
 }
 

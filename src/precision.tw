@@ -53,16 +53,15 @@ mode systems
 import "state.tw" as st
 import "trainer.tw" as tr
 
-# 0 full, 1 bf16, 2 f16. An I64 discriminant for the same reason OptState.kind
-# is one: the subset has no sum types (docs/needs.md entry 5). It is also
-# standing in for a dtype-valued field, which the language cannot spell at all
-# (docs/needs.md entry 17).
-let PREC_FULL = 0
-let PREC_BF16 = 1
-let PREC_F16 = 2
+# The dtype the forward pass runs in. It is still standing in for a dtype-valued
+# field, which the language cannot spell at all (docs/needs.md entry 17), but it
+# is no longer standing in for a sum type: a fourth precision now has to be
+# handled in `narrow` and in `mixed_step` or the checker says so, and the
+# alternative was an if-chain whose final fallthrough silently meant "full".
+enum Prec { Full, Bf16, F16 }
 
 struct Policy {
-  kind: I64,
+  kind: Prec,
   # The current loss scale. 1.0 and pinned for full and bf16; dynamic for f16.
   # Always a power of two, so scaling and unscaling touch only the exponent
   # and never re-round a mantissa.
@@ -87,7 +86,7 @@ struct Policy {
 # It exists so a step function can flip between policies by changing one
 # constructor rather than its own text.
 fn full() -> Policy {
-  Policy { kind: PREC_FULL, scale: 1.0, growth: 1000000000, good: 0,
+  Policy { kind: Full, scale: 1.0, growth: 1000000000, good: 0,
            min_scale: 1.0, max_scale: 1.0, skipped: 0, last_loss: 0.0 }
 }
 
@@ -96,7 +95,7 @@ fn full() -> Policy {
 # the scale is pinned at 1.0 and the machinery below reduces to the skip,
 # which any dtype deserves. See docs/dtypes.md, "bf16 against f16, honestly".
 fn mixed_bf16() -> Policy {
-  Policy { kind: PREC_BF16, scale: 1.0, growth: 1000000000, good: 0,
+  Policy { kind: Bf16, scale: 1.0, growth: 1000000000, good: 0,
            min_scale: 1.0, max_scale: 1.0, skipped: 0, last_loss: 0.0 }
 }
 
@@ -107,7 +106,7 @@ fn mixed_bf16() -> Policy {
 # routinely tiny from doubling forever and spending every 2000th step
 # overflowed on purpose.
 fn mixed_f16() -> Policy {
-  Policy { kind: PREC_F16, scale: 65536.0, growth: 2000, good: 0,
+  Policy { kind: F16, scale: 65536.0, growth: 2000, good: 0,
            min_scale: 1.0, max_scale: 16777216.0, skipped: 0, last_loss: 0.0 }
 }
 
@@ -118,18 +117,18 @@ fn mixed_f16() -> Policy {
 # f32 weights rather than f64 ones.
 fn masters(params: Tree) -> Tree = map_leaves(fn(w) = w.to(f32), params)
 
-# The if-chain over kind exists because a dtype cannot be stored in a struct
-# field and handed to .to: dtype names are contextual, read only where a
-# constructor or .to expects one, so each name has to be written out here
-# literally. See docs/needs.md entry 17.
+# One arm per precision, because a dtype cannot be stored in a struct field and
+# handed to .to: dtype names are contextual, read only where a constructor or
+# .to expects one, so each name has to be written out here literally. See
+# docs/needs.md entry 17. The match makes that literal writing-out the thing the
+# checker enforces: adding a case to Prec and forgetting this function is now an
+# error rather than a tensor that silently stays wide.
 fn narrow(pol: Policy, t: Tensor) -> Tensor {
-  if pol.kind == PREC_BF16 {
-    return t.to(bf16)
+  match pol.kind {
+    Bf16 => t.to(bf16),
+    F16 => t.to(f16),
+    Full => t,
   }
-  if pol.kind == PREC_F16 {
-    return t.to(f16)
-  }
-  t
 }
 
 fn narrow_tree(pol: Policy, master: Tree) -> Tree =
@@ -187,7 +186,7 @@ fn double_scale(pol: Policy) -> F64 {
 # step function cannot close over a local.
 fn mixed_step(pol: Policy, params: Tree, opt: st.OptState, x: Tensor, y: Tensor,
               lr: F64, loss_fn: fn(Tree, Tensor, Tensor) -> Tensor) -> st.StepResult {
-  if pol.kind == PREC_FULL {
+  if pol.kind == Full {
     return tr.default_step(params, opt, x, y, lr, loss_fn)
   }
   # The batch is narrowed along with the weights. Leaving x wide would let
