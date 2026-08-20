@@ -113,10 +113,12 @@ fn main() {
     cb.checkpointing("runs/blobs.ckpt", 10, true, "accuracy", true),
   ]
 
-  let err = tr.fit(run, cbs, parts.train, parts.val, step, eval_batch)
-  if len(err) > 0 {
-    print("loom: " + err)
-    exit(1)
+  match tr.fit(run, cbs, parts.train, parts.val, step, eval_batch) {
+    Ok(_) => unit,
+    Err(msg) => {
+      print("loom: " + msg)
+      exit(1)
+    },
   }
 
   print("trained " + str(run.st.epoch) + " epochs")

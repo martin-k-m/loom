@@ -148,13 +148,13 @@ fn opt_names_differ(stored: st.OptKind, running: st.OptKind) -> Str {
 # mutates `r` and returns nothing on success, so the honest signature is
 # `Res[Unit, Str]`, and every fallible function in loom has the same shape and
 # has to move together with its tests. See docs/needs.md entry 4.
-fn restore(r: st.Run, c: Checkpoint, rows: I64) -> Str {
+fn restore(r: st.Run, c: Checkpoint, rows: I64) -> Res[Unit, Str] {
   if c.format != FORMAT {
-    return "checkpoint format " + str(c.format) + " is not format " + str(FORMAT)
+    return Err("checkpoint format " + str(c.format) + " is not format " + str(FORMAT))
   }
   if c.rows != rows {
-    return "checkpoint was written over " + str(c.rows)
-      + " rows and this dataset has " + str(rows)
+    return Err("checkpoint was written over " + str(c.rows)
+      + " rows and this dataset has " + str(rows))
   }
   # Decoded, not compared as integers, so a code this build has no name for is
   # reported as unrecognised rather than as a mismatch against a rule it might
@@ -162,20 +162,20 @@ fn restore(r: st.Run, c: Checkpoint, rows: I64) -> Str {
   # say so.
   let opt_bad = opt_mismatch(c.opt_kind, r.opt.kind)
   if len(opt_bad) > 0 {
-    return opt_bad
+    return Err(opt_bad)
   }
   if c.seed != r.cfg.seed {
     # The seed is the run. Resuming under a different one produces a different
     # batch order from the resume point and a result that is neither of the two
     # runs, so it is refused rather than warned about.
-    return "checkpoint was written under seed " + str(c.seed)
-      + " and this run is seeded " + str(r.cfg.seed)
+    return Err("checkpoint was written under seed " + str(c.seed)
+      + " and this run is seeded " + str(r.cfg.seed))
   }
   if c.batch_size != r.cfg.batch_size {
     # Changing the batch size changes the number of updates per epoch and the
     # weighting of every metric, so a resume across it is a different run.
-    return "checkpoint used batch size " + str(c.batch_size)
-      + " and this run uses " + str(r.cfg.batch_size)
+    return Err("checkpoint used batch size " + str(c.batch_size)
+      + " and this run uses " + str(r.cfg.batch_size))
   }
   r.params = c.params
   r.opt.m = c.opt_m
@@ -192,5 +192,5 @@ fn restore(r: st.Run, c: Checkpoint, rows: I64) -> Str {
   r.st.val_loss = c.val_loss
   r.st.stop = false
   r.st.stop_reason = ""
-  ""
+  Ok(unit)
 }

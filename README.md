@@ -111,8 +111,10 @@ let cbs: Arr[cb.Callback] = [
   cb.progress(24, 0),
 ]
 
-let err = tr.fit(run, cbs, train, val, step, eval_batch)
-if len(err) > 0 { print("loom: " + err) }
+match tr.fit(run, cbs, train, val, step, eval_batch) {
+  Ok(_) => unit,
+  Err(msg) => print("loom: " + msg),
+}
 
 let pred = tr.predict(run.params, val.x, 64, logits)
 ```

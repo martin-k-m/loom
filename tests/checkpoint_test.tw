@@ -4,6 +4,19 @@ import "harness.tw" as t
 import "../src/checkpoint.tw" as ckpt
 import "../src/state.tw" as st
 
+# The refusal message from a result that is expected to carry one, and "" from a
+# success. Both shapes of assertion in this file are written against it: a
+# refusal is a message with something in it, and an acceptance is the empty
+# string, which is what these tests said before `validate` and `restore` moved
+# onto `Res` and is still what they mean.
+fn refusal(r: Res[Unit, Str]) -> Str {
+  match r {
+    Err(msg) => msg,
+    Ok(_) => "",
+  }
+}
+
+
 fn a_run(seed: I64, batch_size: I64) -> st.Run {
   let params = [[1.0, 2.0], [3.0, 4.0]]
   let cfg = st.config(20, batch_size, 0.01, seed)
@@ -27,7 +40,7 @@ fn a_checkpoint_carries_the_optimiser_moments_and_step_count() {
   let none: Arr[F64] = []
   let c = ckpt.build(src, none, 52, "test")
   let dst = a_run(7, 4)
-  t.equal_str("restore succeeds", ckpt.restore(dst, c, 52), "")
+  t.equal_str("restore succeeds", refusal(ckpt.restore(dst, c, 52)), "")
   t.check("the parameters came back", dst.params == src.params)
   t.check("the first moment came back", dst.opt.m == src.opt.m)
   t.check("the second moment came back", dst.opt.v == src.opt.v)
@@ -65,7 +78,7 @@ fn a_checkpoint_from_a_different_dataset_is_refused() {
   let none: Arr[F64] = []
   let c = ckpt.build(src, none, 52, "test")
   let dst = a_run(7, 4)
-  t.check("a different row count is refused", len(ckpt.restore(dst, c, 51)) > 0)
+  t.check("a different row count is refused", len(refusal(ckpt.restore(dst, c, 51))) > 0)
 }
 
 fn a_checkpoint_from_a_different_seed_is_refused() {
@@ -73,7 +86,7 @@ fn a_checkpoint_from_a_different_seed_is_refused() {
   let none: Arr[F64] = []
   let c = ckpt.build(src, none, 52, "test")
   let dst = a_run(8, 4)
-  t.check("a different seed is refused", len(ckpt.restore(dst, c, 52)) > 0)
+  t.check("a different seed is refused", len(refusal(ckpt.restore(dst, c, 52))) > 0)
 }
 
 fn a_checkpoint_from_a_different_batch_size_is_refused() {
@@ -81,7 +94,7 @@ fn a_checkpoint_from_a_different_batch_size_is_refused() {
   let none: Arr[F64] = []
   let c = ckpt.build(src, none, 52, "test")
   let dst = a_run(7, 8)
-  t.check("a different batch size is refused", len(ckpt.restore(dst, c, 52)) > 0)
+  t.check("a different batch size is refused", len(refusal(ckpt.restore(dst, c, 52))) > 0)
 }
 
 fn a_checkpoint_from_a_different_optimiser_is_refused() {
@@ -90,7 +103,7 @@ fn a_checkpoint_from_a_different_optimiser_is_refused() {
   let c = ckpt.build(src, none, 52, "test")
   let dst = a_run(7, 4)
   dst.opt = st.sgd(dst.params)
-  t.check("adam state is not restored into sgd", len(ckpt.restore(dst, c, 52)) > 0)
+  t.check("adam state is not restored into sgd", len(refusal(ckpt.restore(dst, c, 52))) > 0)
 }
 
 fn a_checkpoint_of_a_future_format_is_refused() {
@@ -99,7 +112,7 @@ fn a_checkpoint_of_a_future_format_is_refused() {
   let c = ckpt.build(src, none, 52, "test")
   c.format = 99
   let dst = a_run(7, 4)
-  t.check("an unknown format is refused", len(ckpt.restore(dst, c, 52)) > 0)
+  t.check("an unknown format is refused", len(refusal(ckpt.restore(dst, c, 52))) > 0)
 }
 
 a_checkpoint_carries_the_optimiser_moments_and_step_count()

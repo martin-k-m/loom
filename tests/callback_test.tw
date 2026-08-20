@@ -5,6 +5,19 @@ import "../src/callback.tw" as cb
 import "../src/state.tw" as st
 import "../src/metrics.tw" as met
 
+# The refusal message from a result that is expected to carry one, and "" from a
+# success. Both shapes of assertion in this file are written against it: a
+# refusal is a message with something in it, and an acceptance is the empty
+# string, which is what these tests said before `validate` and `restore` moved
+# onto `Res` and is still what they mean.
+fn refusal(r: Res[Unit, Str]) -> Str {
+  match r {
+    Err(msg) => msg,
+    Ok(_) => "",
+  }
+}
+
+
 fn a_run(epochs: I64, lr: F64) -> st.Run {
   let cfg = st.config(epochs, 4, lr, 7)
   st.Run { params: 0.0, opt: st.sgd(0.0), cfg: cfg, st: st.new_state(cfg) }
@@ -55,20 +68,20 @@ fn end_hooks_are_the_reverse_of_begin_hooks() {
 
 fn two_writers_of_the_same_state_field_are_refused() {
   let two_schedules: Arr[cb.Callback] = [cb.step_lr(0.1, 0.5, 2), cb.exp_lr(0.1, 0.9)]
-  t.check("two schedules are rejected", len(cb.validate(two_schedules)) > 0)
+  t.check("two schedules are rejected", len(refusal(cb.validate(two_schedules))) > 0)
   let two_stoppers: Arr[cb.Callback] = [
     cb.early_stopping("loss", false, 2, 0.0),
     cb.early_stopping("accuracy", true, 2, 0.0),
   ]
-  t.check("two early stoppers are rejected", len(cb.validate(two_stoppers)) > 0)
+  t.check("two early stoppers are rejected", len(refusal(cb.validate(two_stoppers))) > 0)
   let ok: Arr[cb.Callback] = [cb.step_lr(0.1, 0.5, 2), cb.early_stopping("loss", false, 2, 0.0)]
-  t.equal_str("one of each is accepted", cb.validate(ok), "")
+  t.equal_str("one of each is accepted", refusal(cb.validate(ok)), "")
 }
 
 fn a_band_outside_the_documented_range_is_refused() {
   let c = cb.metric_log(false)
   c.order = 99
-  t.check("an out-of-band callback is rejected", len(cb.validate([c])) > 0)
+  t.check("an out-of-band callback is rejected", len(refusal(cb.validate([c]))) > 0)
 }
 
 # ---- improvement tracking -------------------------------------------------
@@ -227,7 +240,7 @@ fn callback_state_round_trips_through_a_pack() {
     cb.early_stopping("loss", false, 3, 0.0),
     cb.plateau_lr("loss", false, 0.5, 2, 0.0),
   ]
-  t.equal_str("unpacking a matching list succeeds", cb.unpack_state(fresh, packed), "")
+  t.equal_str("unpacking a matching list succeeds", refusal(cb.unpack_state(fresh, packed)), "")
   t.equal_i64("the wait survived", fresh[0].wait, 2)
   t.near("the best survived", fresh[0].best, 0.375, 0.0)
   t.equal_i64("the best epoch survived", fresh[0].best_epoch, 4)
@@ -238,9 +251,9 @@ fn unpacking_into_a_different_callback_list_is_refused() {
   let two: Arr[cb.Callback] = [cb.early_stopping("loss", false, 3, 0.0), cb.metric_log(false)]
   let packed = cb.pack_state(two)
   let one: Arr[cb.Callback] = [cb.early_stopping("loss", false, 3, 0.0)]
-  t.check("a shorter list is refused", len(cb.unpack_state(one, packed)) > 0)
+  t.check("a shorter list is refused", len(refusal(cb.unpack_state(one, packed))) > 0)
   let swapped: Arr[cb.Callback] = [cb.metric_log(false), cb.early_stopping("loss", false, 3, 0.0)]
-  t.check("a reordered list is refused", len(cb.unpack_state(swapped, packed)) > 0)
+  t.check("a reordered list is refused", len(refusal(cb.unpack_state(swapped, packed))) > 0)
 }
 
 callbacks_run_by_band_and_not_by_the_order_they_were_listed()

@@ -64,22 +64,31 @@ entry 5.
 
 ### 4. Multiple return values, or `Res[T, E]`
 
-**Used by:** `src/trainer.tw` (`fit` returns a run and an error),
-`src/checkpoint.tw` (`restore`), `src/callback.tw` (`validate`,
-`unpack_state`), `src/data.tw` (`take`, `split`)
-**Status:** `Res[T, E]`, `Opt[T]` and postfix `?` landed in twill 1.6. Multiple
-returns are still not designed anywhere, and loom has not yet moved onto `Res`.
+**Used by:** `src/trainer.tw` (`fit`, `resume`), `src/checkpoint.tw`
+(`restore`), `src/callback.tw` (`validate`, `unpack_state`)
+**Status:** done for `Res[T, E]` (2026-08, on twill 1.7); multiple return values
+are still not designed anywhere and are a separate want.
 
-Every fallible function in loom returns a `Str` that is empty on success, which
-is spool's convention and has spool's problem: the compiler does not make anyone
-read it. That is now a choice rather than a constraint, and the reason it has
-not been made yet is that it is one change and not several: `fit`, `restore`,
-`validate`, `unpack_state`, `take` and `split` all have the shape, they call
-each other, and moving one without the rest means two conventions in one
-repository, which is worse than either. It is the next thing worth doing here. Every function that wants to return two things returns a struct
-declared for that one call site, which is why `src/data.tw` has a `Batch` and
-`src/state.tw` has a `StepResult`. Neither struct is a type anyone wanted; both
-are a tuple with a name.
+The five fallible functions returned a `Str` that was empty on success. They
+return `Res[Unit, Str]` now, and they were moved together, which is what this
+entry said had to happen: they call each other, and two conventions in one
+repository is worse than either.
+
+`fit` shows what it bought. It opened with
+
+    let bad = cb.validate(cbs_in)
+    if len(bad) > 0 { return bad }
+
+which is a propagation written out by hand, and is now `cb.validate(cbs_in)?`.
+`resume` had the same shape around `restore` and lost it the same way.
+
+**The multiple-returns half of this entry stands, and `Res` is not the answer to
+it.** `take` returns a `Batch` and `split` returns a `Split`, and this entry
+called both "a tuple with a name". They are -- but neither function can fail, so
+there is no failure channel to remove and wrapping them in a `Res` would say
+something untrue. What they want is a way to return two values, which twill
+still does not have. `Batch` and `Split` therefore stay exactly as they were,
+and the reason is recorded here so the next reader does not convert them.
 
 ### 5. Sum types and `match`
 

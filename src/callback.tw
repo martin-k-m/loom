@@ -310,7 +310,7 @@ fn ordered(cbs: Arr[Callback]) -> Arr[Callback] {
 
 # The two ordering rules, checked once at the start of a run instead of trusted.
 # Returns an error string, empty when the set is sound.
-fn validate(cbs: Arr[Callback]) -> Str {
+fn validate(cbs: Arr[Callback]) -> Res[Unit, Str] {
   let schedules = 0
   let stoppers = 0
   let i = 0
@@ -326,8 +326,8 @@ fn validate(cbs: Arr[Callback]) -> Str {
       Progress => unit,
     }
     if c.order < ORDER_SCHEDULE or c.order > ORDER_PROGRESS {
-      return "callback " + c.name + " has order " + str(c.order)
-        + ", outside the documented bands 10..50"
+      return Err("callback " + c.name + " has order " + str(c.order)
+        + ", outside the documented bands 10..50")
     }
     i = i + 1
   }
@@ -335,12 +335,12 @@ fn validate(cbs: Arr[Callback]) -> Str {
   # arranged to prevent, and the result would depend on their relative bands,
   # which the caller did not choose. Refuse it.
   if schedules > 1 {
-    return "two learning-rate schedules are registered; both write State.lr"
+    return Err("two learning-rate schedules are registered; both write State.lr")
   }
   if stoppers > 1 {
-    return "two early-stopping callbacks are registered; both write State.stop"
+    return Err("two early-stopping callbacks are registered; both write State.stop")
   }
-  ""
+  Ok(unit)
 }
 
 # ---- dispatch -------------------------------------------------------------
@@ -644,18 +644,18 @@ fn pack_state(cbs: Arr[Callback]) -> Arr[F64] {
   out
 }
 
-fn unpack_state(cbs: Arr[Callback], packed: Arr[F64]) -> Str {
+fn unpack_state(cbs: Arr[Callback], packed: Arr[F64]) -> Res[Unit, Str] {
   if len(packed) != len(cbs) * PACK_STRIDE {
-    return "checkpoint holds state for " + str(len(packed) // PACK_STRIDE)
-      + " callbacks and this run registers " + str(len(cbs))
+    return Err("checkpoint holds state for " + str(len(packed) // PACK_STRIDE)
+      + " callbacks and this run registers " + str(len(cbs)))
   }
   let i = 0
   while i < len(cbs) {
     let base = i * PACK_STRIDE
     if i64(packed[base]) != kind_code(cbs[i].kind) {
-      return "checkpoint callback " + str(i) + " is kind "
+      return Err("checkpoint callback " + str(i) + " is kind "
         + str(i64(packed[base])) + " and this run has kind "
-        + kind_name(cbs[i].kind)
+        + kind_name(cbs[i].kind))
     }
     cbs[i].wait = i64(packed[base + 1])
     cbs[i].best = packed[base + 2]
@@ -663,5 +663,5 @@ fn unpack_state(cbs: Arr[Callback], packed: Arr[F64]) -> Str {
     cbs[i].seen = packed[base + 4] > 0.5
     i = i + 1
   }
-  ""
+  Ok(unit)
 }

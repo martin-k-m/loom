@@ -13,6 +13,19 @@ import "../src/metrics.tw" as met
 import "../src/callback.tw" as cb
 import "../src/checkpoint.tw" as ckpt
 
+# The refusal message from a result that is expected to carry one, and "" from a
+# success. Both shapes of assertion in this file are written against it: a
+# refusal is a message with something in it, and an acceptance is the empty
+# string, which is what these tests said before `validate` and `restore` moved
+# onto `Res` and is still what they mean.
+fn refusal(r: Res[Unit, Str]) -> Str {
+  match r {
+    Err(msg) => msg,
+    Ok(_) => "",
+  }
+}
+
+
 # A linear model with a squared loss. Small, convex, and with an analytic
 # gradient, so a wrong answer here is a bug in loom and not in the model.
 fn linear_loss(p: Tree, x: Tensor, y: Tensor) -> Tensor {
@@ -71,7 +84,7 @@ fn a_resumed_run_equals_an_uninterrupted_one() {
   let saved = ckpt.build(first, cb.pack_state(none), toy().n, "half way")
 
   let second = run_for(20, 3)
-  t.equal_str("the restore succeeds", ckpt.restore(second, saved, toy().n), "")
+  t.equal_str("the restore succeeds", refusal(ckpt.restore(second, saved, toy().n)), "")
   t.equal_i64("the resumed run starts at epoch 10", second.st.epoch, 10)
   tr.fit(second, none, toy(), dt.empty(), step, eval_batch)
 
@@ -154,7 +167,7 @@ fn a_schedule_moves_the_rate_the_run_actually_trains_at() {
 fn a_rejected_callback_set_stops_the_run_before_it_starts() {
   let cbs: Arr[cb.Callback] = [cb.step_lr(0.05, 0.5, 2), cb.exp_lr(0.05, 0.9)]
   let r = run_for(5, 3)
-  t.check("two schedules are refused by fit", len(tr.fit(r, cbs, toy(), dt.empty(), step, eval_batch)) > 0)
+  t.check("two schedules are refused by fit", len(refusal(tr.fit(r, cbs, toy(), dt.empty(), step, eval_batch))) > 0)
   t.equal_i64("and no epoch ran", r.st.epoch, 0)
 }
 
@@ -162,7 +175,7 @@ fn an_empty_training_set_is_an_error_rather_than_a_silent_no_op() {
   let none: Arr[cb.Callback] = []
   let r = run_for(5, 3)
   t.check("an empty training set is refused",
-    len(tr.fit(r, none, dt.empty(), dt.empty(), step, eval_batch)) > 0)
+    len(refusal(tr.fit(r, none, dt.empty(), dt.empty(), step, eval_batch))) > 0)
 }
 
 fn predict_returns_one_row_per_input_row_in_input_order() {

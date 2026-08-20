@@ -50,16 +50,15 @@ import "std/optim" as optim
 # be one; see docs/needs.md entry 4 for why loom has not moved yet.
 fn fit(r: st.Run, cbs_in: Arr[cb.Callback], train: dt.Dataset, val: dt.Dataset,
        step: fn(Tree, st.OptState, Tensor, Tensor, F64) -> st.StepResult,
-       eval_batch: fn(Tree, Tensor, Tensor) -> met.MeterSet) -> Str {
-  let bad = cb.validate(cbs_in)
-  if len(bad) > 0 {
-    return bad
-  }
+       eval_batch: fn(Tree, Tensor, Tensor) -> met.MeterSet) -> Res[Unit, Str] {
+  # `?` propagates the refusal, which is the whole shape this file used to
+  # spell as a `bad` binding and a length test.
+  cb.validate(cbs_in)?
   if r.cfg.batch_size <= 0 {
-    return "batch_size must be positive"
+    return Err("batch_size must be positive")
   }
   if train.n == 0 {
-    return "the training set is empty"
+    return Err("the training set is empty")
   }
   # Ordered once, here, and used for every hook. Re-sorting per hook would let
   # a callback that mutated its own order change the sequence mid-run.
@@ -119,7 +118,7 @@ fn fit(r: st.Run, cbs_in: Arr[cb.Callback], train: dt.Dataset, val: dt.Dataset,
   }
 
   cb.dispatch(cbs, r, cb.HOOK_RUN_END)
-  ""
+  Ok(unit)
 }
 
 # ---- evaluation -----------------------------------------------------------
@@ -224,19 +223,15 @@ fn adam_apply(params: Tree, g: Tree, opt: st.OptState, lr: F64, loss: F64) -> st
 # ---- resuming -------------------------------------------------------------
 
 # Read a checkpoint and put it back into a run and its callbacks. Call it before
-# fit; fit then starts at the restored epoch. Returns an error string, empty on
-# success.
-fn resume(r: st.Run, cbs: Arr[cb.Callback], path: Str, rows: I64) -> Str {
+# fit; fit then starts at the restored epoch.
+fn resume(r: st.Run, cbs: Arr[cb.Callback], path: Str, rows: I64) -> Res[Unit, Str] {
   let c = ckpt.read(path)
-  let bad = ckpt.restore(r, c, rows)
-  if len(bad) > 0 {
-    return bad
-  }
+  ckpt.restore(r, c, rows)?
   if len(c.cb_state) == 0 {
     # A best-only checkpoint carries no callback state. Restoring parameters
     # from it is legitimate; resuming training from it is not, and saying so is
     # better than resetting every patience counter without comment.
-    return ""
+    return Ok(unit)
   }
   cb.unpack_state(cbs, c.cb_state)
 }
