@@ -115,7 +115,25 @@ fn a_checkpoint_of_a_future_format_is_refused() {
   t.check("an unknown format is refused", len(refusal(ckpt.restore(dst, c, 52))) > 0)
 }
 
+# The defect this is written against: `checkpointing("runs/blobs.ckpt", ...)` in
+# examples/classifier.tw aborted the run at its first save, because nothing
+# creates "runs/". Every field above round-tripped and the file was never
+# written, which is why eight passing tests said nothing about it.
+fn writing_a_checkpoint_creates_the_directory_the_path_names() {
+  let root = "tmp_ckpt_dir"
+  remove_all(root)
+  let src = advanced(a_run(7, 4))
+  let none: Arr[F64] = []
+  let path = root + "/nested/blobs.ckpt"
+  ckpt.write(src, none, 52, path, "test")
+  t.check("the checkpoint file exists", path_exists(path))
+  let back = ckpt.read(path)
+  t.equal_i64("and it reads back", back.opt_t, 130)
+  remove_all(root)
+}
+
 a_checkpoint_carries_the_optimiser_moments_and_step_count()
+writing_a_checkpoint_creates_the_directory_the_path_names()
 restoring_leaves_the_epoch_budget_alone_so_a_resume_can_extend_a_run()
 restoring_clears_a_stop_so_a_stopped_run_can_be_continued_deliberately()
 a_checkpoint_from_a_different_dataset_is_refused()

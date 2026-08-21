@@ -4,9 +4,11 @@
 
 First cut of loom, the training framework for twill, written in twill.
 
-It does not run. twill's `mode systems` is still being built. See
-`docs/needs.md` for what is missing and `README.md` for the status table.
-Nothing below has ever executed.
+It runs. `twill test tests` passes eight suites and
+`twill run examples/classifier.tw` trains a model, both on twill 1.7.1. This
+paragraph said the opposite until `mode systems` landed in twill 1.6. See
+`docs/needs.md` for what the language still owes this library and `README.md`
+for the status table, which names the test or the example behind every row.
 
 Added:
 

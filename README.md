@@ -23,16 +23,75 @@
 `loom` is written in twill, in `.tw` files, using `mode systems`. That subset
 did not exist when this library was written, so for a long time none of the code
 here executed and this section said so. twill 1.6 is the release that closed it:
-the 8 test suites under `tests/` pass, and CI runs them against a released
-twill on every push rather than gating on the prose in this file.
+the 8 test suites under `tests/` pass, the example trains a model, and CI runs
+both against a released twill on every push rather than gating on the prose in
+this file.
+
+You need twill 1.7.0 or newer. Get one:
 
 ```bash
-twill test tests
+curl -fsSL -o twill https://github.com/twill-lang/twill/releases/download/v1.7.1/twill-v1.7.1-linux-amd64
+chmod +x twill
 ```
 
-You need twill 1.7.0 or newer. `docs/needs.md` is still worth reading -- it
-is the list of what this library asked the language for, and it now records
-which of those arrived and which are still open.
+The asset name is `twill-v1.7.1-<os>-<arch>`: `linux-amd64`, `linux-arm64`,
+`darwin-amd64`, `darwin-arm64`, `windows-amd64.exe`.
+
+The suite, from the repository root:
+
+```
+$ twill test tests
+ok    tests/callback_test.tw
+ok    tests/checkpoint_test.tw
+ok    tests/data_test.tw
+ok    tests/metrics_test.tw
+ok    tests/precision_test.tw
+ok    tests/report_test.tw
+ok    tests/rng_test.tw
+ok    tests/trainer_test.tw
+
+8 file(s): 8 passed, 0 failed
+```
+
+And the example, which trains a three-class MLP and stops early:
+
+```
+$ twill run examples/classifier.tw
+epoch  1/60  loss 1.0444  lr 0.002500  val_loss 0.9346  val_accuracy 0.5972
+epoch  2/60  loss 0.6686  lr 0.005000  val_loss 0.5529  val_accuracy 0.8611
+epoch  3/60  loss 0.3440  lr 0.007500  val_loss 0.3083  val_accuracy 0.9306
+...
+epoch 15/60  loss 0.0208  lr 0.009127  val_loss 0.1256  val_accuracy 0.9583
+stopped: accuracy has not improved for 9 evaluations; best was 0.9583 at epoch 6
+trained 15 epochs
+best parameters are in runs/blobs.ckpt.best
+parameters for selvedge are in runs/blobs.params
+held-out accuracy 0.958333
+```
+
+The elided lines are a per-epoch progress bar and epochs 4 to 14. It writes
+into `examples/runs/`, which it creates.
+
+`docs/needs.md` is still worth reading -- it is the list of what this library
+asked the language for, and it now records which of those arrived and which are
+still open.
+
+## The pipeline
+
+loom is the first of three repositories and the other two consume what it
+writes. There is no packaging step between them; the handoff is a file.
+
+```bash
+cd loom     && twill run examples/classifier.tw
+cp loom/examples/runs/blobs.params selvedge/examples/runs/blobs.params
+cd selvedge && twill run examples/publish.tw
+cp selvedge/examples/models/blobs-1.2.0.slv shuttle/examples/models/blobs-1.2.0.slv
+cd shuttle  && twill run examples/serve.tw
+```
+
+Each of the three examples also runs on its own, with a fixture it generates and
+a printed line saying which part of the result is not real. The chain above is
+what makes all three real at once.
 
 ## What loom is
 
@@ -41,18 +100,22 @@ The layer above `std/nn`. `std/nn` gives you layers, activations and losses;
 survives a short final batch, a checkpoint you can resume from, or a place to
 hang early stopping. That is loom.
 
+Every row below names the test or the example that runs it. A row that names
+nothing is a row that claims nothing.
+
 | Piece | State |
 | --- | --- |
-| `fit` / `evaluate` / `predict`, with the step function passed in | written, unrun |
-| Callbacks with a total, documented order and seven hook points | written, unrun |
-| Early stopping, checkpointing, LR schedules, metric logging, progress | written, unrun |
-| Checkpoint and restore covering parameters, optimiser state and epoch | written, unrun |
-| Batch-size-weighted metric accumulation | written, unrun |
-| Reproducibility from one explicit seed, threaded, no hidden global | written, unrun |
-| Mixed precision: bf16 and f16 policies, f32 masters, dynamic loss scaling | written, unrun |
-| Coloured output and a progress bar with a time estimate | **not possible.** See below |
-| Distributed training, gradient accumulation | **not in v0.1** |
-| Anything running end to end | **no** |
+| `fit` / `evaluate` / `predict`, with the step function passed in | runs. `tests/trainer_test.tw`, and `examples/classifier.tw` trains through it |
+| Callbacks with a total, documented order and seven hook points | runs. `tests/callback_test.tw` asserts the band order and the reversal |
+| Early stopping, checkpointing, LR schedules, metric logging, progress | runs. `tests/callback_test.tw`, and the example configures all five at once |
+| Checkpoint and restore covering parameters, optimiser state and epoch | runs. `tests/checkpoint_test.tw`, and `a_resumed_run_equals_an_uninterrupted_one` in `tests/trainer_test.tw` |
+| Batch-size-weighted metric accumulation | runs. `tests/metrics_test.tw`, and `the_epoch_loss_is_weighted_by_batch_size` |
+| Reproducibility from one explicit seed, threaded, no hidden global | runs. `tests/rng_test.tw` pins the stream against a reference splitmix64 |
+| Mixed precision: bf16 and f16 policies, f32 masters, dynamic loss scaling | runs under `tests/precision_test.tw`. No example uses it, and no run has been trained in it |
+| Coloured output, and a progress bar | runs. `src/report.tw` calls `std/term`, and `tests/report_test.tw` covers the formatting |
+| A time estimate on the progress bar | **not wired.** twill 1.7 has `mono_ns`; loom does not call it. See below |
+| Distributed training, gradient accumulation | **not in v0.1.** Nothing here does either |
+| Anything running end to end | runs. `twill run examples/classifier.tw`, output above |
 
 ## The loop is not hidden
 
@@ -119,17 +182,19 @@ match tr.fit(run, cbs, train, val, step, eval_batch) {
 let pred = tr.predict(run.params, val.x, 64, logits)
 ```
 
-Output, one line per epoch:
+Output, one line per epoch. This is the run above, not a sketch of one:
 
 ```
-epoch  1/60  loss 1.0421  lr 0.002500  val_loss 0.9980  val_accuracy 0.4167
-epoch  2/60  loss 0.9013  lr 0.005000  val_loss 0.8442  val_accuracy 0.6667
+epoch  1/60  loss 1.0444  lr 0.002500  val_loss 0.9346  val_accuracy 0.5972
+epoch  2/60  loss 0.6686  lr 0.005000  val_loss 0.5529  val_accuracy 0.8611
 ...
-epoch 41/60  loss 0.0942  lr 0.000412  val_loss 0.1180  val_accuracy 0.9583
-stopped: accuracy has not improved for 9 evaluations; best was 0.9583 at epoch 32
+epoch 15/60  loss 0.0208  lr 0.009127  val_loss 0.1256  val_accuracy 0.9583
+stopped: accuracy has not improved for 9 evaluations; best was 0.9583 at epoch 6
 ```
 
-`examples/classifier.tw` is the same program, complete.
+Sixty epochs were budgeted and fifteen were run, because on three well separated
+blobs the accuracy reaches its ceiling in six and early stopping is doing its
+job. `examples/classifier.tw` is the same program, complete.
 
 ## Callback ordering
 
@@ -284,36 +349,44 @@ checkpointed: a resumed f16 run re-converges its scale rather than restoring
 it, so it is not bit-identical to an uninterrupted run while the scales
 differ. bf16 has no such window, which is one more reason it is the default.
 
-## No colour, and no progress estimate
+## Colour, and the missing time estimate
 
-Stated plainly because it is a gap and not a decision. twill has a real terminal
-layer in `src/term/` and a determinate progress bar in `src/cli/progress.tw`,
-with capability detection, the palette and a smoothed time estimate. loom cannot
-call them: twill resolves a non-`std/` import as a path relative to the
-importing file, so only modules under `std/` are reachable from an installed
-package, and the terminal layer is not one.
+Colour was the gap and is not one any more. twill's terminal layer is
+`std/term/caps`, `std/term/ansi` and `std/term/theme`, which are ordinary `std/`
+modules and therefore reachable from an installed package. `src/report.tw`
+imports all three, detects the terminal's capabilities and lights the loss value
+and the bar's fill, dropping to plain text the moment the output is piped.
 
-loom therefore prints plain uncoloured lines, one per epoch, and its `bar` is a
-fill with no time remaining. The useful part of a progress bar for a 400-epoch
-run is the estimate, so this is worse than what twill already has.
+What is still missing is the time estimate, and it is now missing because loom
+has not written it rather than because twill cannot. twill 1.7 has `mono_ns`
+and `clock_now_ms`; loom calls neither, so `bar` is a fill and a percentage
+with no remaining-time figure. For a 400-epoch run the estimate is the useful
+part of a progress bar, so this is the gap worth closing next.
 
-The fix is not to widen the import rule. It is to promote capability detection,
-the palette and the bar into `std/term`, at which point loom deletes its
-formatting helpers. `docs/needs.md` entry 8. Duplicating the bar here was the
-obvious alternative and was rejected: two progress bars in one ecosystem drift,
-and the drift is visible to users.
+The work is not the arithmetic. It is threading a time source through the
+trainer so that a resumed run's estimate is not computed from a start time it
+never had, which is a correctness surface of its own. `docs/needs.md` entry 16.
+Duplicating a stateful bar from elsewhere in the ecosystem is still rejected for
+the reason it always was: two progress bars drift, and the drift is visible to
+users.
 
 ## Install
 
-Once spool and `mode systems` both work:
+`mode systems` works. spool does not vendor loom for you yet, so until it does
+the two ways in are a clone beside your project, or:
 
 ```
 spool add loom https://github.com/twill-lang/loom
 ```
 
-spool vendors into `twill_modules/`, and twill's import is a path, so the import
-lines are the long ones in the example above and they resolve relative to the
-project root. That is twill's rule rather than loom's; see spool's README.
+spool vendors into `twill_modules/`, and twill's import is a path, which is why
+the import lines in the example above are the long ones. **A path in twill,
+whether it is an import or an argument to `read_file` or `save`, resolves
+against the directory of the file that contains it, not against the working
+directory.** So the imports above are written from the file that does the
+importing, and `twill run examples/classifier.tw` writes into `examples/runs/`
+whatever directory you invoke it from. That is twill's rule rather than loom's;
+see spool's README.
 
 ## Repository layout
 

@@ -1,9 +1,13 @@
 # What loom needs from twill
 
-loom is written in twill and does not run yet. This file is the reason: the
-language and runtime features the source uses that twill does not provide
-today, with the file and function that needs each one, and what loom does in
-the meantime.
+loom is written in twill and it runs: `twill test tests` passes eight suites and
+`twill run examples/classifier.tw` trains a model. This file is no longer the
+reason it does not run. It is the record of what this library asked the language
+for, with the file and function that needed each one, what loom did in the
+meantime, and, for the ones that have since arrived, whether loom has taken them
+up. An entry the language delivered and loom has not wired up says exactly
+that, because "twill cannot" and "loom has not" are different sentences and only
+one of them is a language work item.
 
 It is a work queue for the language, not a complaint. Every entry was reached by
 writing real code and hitting the wall, which is the only way a list like this
@@ -15,24 +19,26 @@ The baseline is milestone 1 of `docs/self-hosting.md` in the twill repository:
 indexing, `Arr[T]`, `Dict[Str, V]`, `struct`, and `read_file`. Everything below
 is on top of that.
 
-## Blocking: loom cannot run at all without these
+## Was blocking: loom could not run at all without these
 
 ### 1. `mode systems` itself
 
 **Used by:** every file
-**Status:** designed in `docs/self-hosting.md`, not implemented.
+**Status:** DELIVERED in twill 1.6. Closed.
 
-Nothing else on this list matters until this does.
+Nothing else on this list mattered until this did. It landed, and everything
+under `src/` and `tests/` has run against a released twill since.
 
 ### 2. A type for a parameter tree
 
 **Needs:** a spelling for "a tensor, or a list or record nesting tensors"
 **Used by:** `src/state.tw` (`OptState`, `Run`, `StepResult`), `src/trainer.tw`
 (`fit`, `evaluate`, `predict`, `apply`), `src/checkpoint.tw` (`Checkpoint`)
-**Status:** the concept exists at runtime (`map_leaves`, `zip_leaves`, and
-`grad` following record structure) and has no name in the type language.
+**Status:** DELIVERED. `Tree` is the name. loom writes it in every signature
+that takes a parameter tree and the code checks and runs, so the guess below was
+right and the rest of this entry is kept as the record of what was asked for.
 
-loom writes `Tree` everywhere a parameter tree appears and assumes it will be
+loom writes `Tree` everywhere a parameter tree appears and assumed it would be
 the name. It is the single most-used type in this repository, it is the type
 `std/optim` is already generic over, and systems mode makes annotations
 mandatory, so every one of those functions is currently unwritable as specified.
@@ -49,11 +55,12 @@ model's shape.
 stored by a systems-mode function
 **Used by:** `src/trainer.tw` (`fit` takes `step` and `eval_batch`; `predict`
 takes `forward`; `default_step` takes `loss_fn`)
-**Status:** functions are values in numeric twill; whether a systems-mode
-function may take one, and how the type is spelled, is not stated anywhere.
+**Status:** DELIVERED. A systems-mode function takes a function value and the
+type is spelled `fn(A, B) -> C`. `tr.fit` takes `step` and `eval_batch` that
+way and `examples/classifier.tw` trains through both.
 
 loom writes `step: fn(Tree, st.OptState, Tensor, Tensor, F64) -> st.StepResult`
-and assumes that syntax. This is not a convenience: the explicit step function
+and that is the syntax. This is not a convenience: the explicit step function
 is the design. A trainer that hid the update rule inside itself would be the
 thing loom exists not to be, and without function parameters there is no way to
 hand one in.
@@ -123,7 +130,14 @@ checkpoints written before this survive it.
 that can be held rather than a global one
 **Used by:** `src/rng.tw`, and therefore `src/trainer.tw` and
 `src/checkpoint.tw`
-**Status:** `seed(n)` sets a position; nothing reads it.
+**Status:** DELIVERED in twill 1.7, and loom has not taken it up. The language
+grew the better of the two answers this entry asked for: a held generator,
+`rng_open(seed)` with `rng_close`, `rng_f64`, `rng_u53`, `rng_uniform`,
+`rng_norm`, `rng_normal` and `rng_perm` drawing from it. `seed(n)` and the
+global stream are still there and are still what `src/rng.tw` calls.
+
+The rest of this entry describes the workaround loom is still running, and it
+is now a workaround for a gap that is loom's rather than twill's.
 
 A resumed run must draw the same numbers the uninterrupted run would have, and
 the generator's position after ten epochs is not recoverable from the seed alone
@@ -141,7 +155,7 @@ subsequent training batch, and the only reason `src/trainer.tw` gets away with
 not worrying about that is that its evaluation path draws nothing. That is a
 property maintained by inspection, which is the wrong way to maintain anything.
 
-## Blocking: features the source assumes exist
+## Was blocking: features the source assumed exist
 
 ### 7. I64 bitwise operators, spelled
 
@@ -169,32 +183,29 @@ logical shift so the helper can be deleted, not a change of semantics.
 
 **Needs:** `src/term/` and `src/cli/` reachable from a package
 **Used by:** `src/report.tw`, which now calls them
-**Status:** RESOLVED for colour and capability detection. The stateful bar is
-still deliberately not adopted; see below.
+**Status:** DELIVERED for colour and capability detection, and taken up. The
+stateful bar is still deliberately not adopted; see below.
 
-The resolution was not the one predicted here. Rather than promoting parts of
-the terminal layer into `std/`, twill made its `src/term/` and `src/cli/`
-modules import each other by a path relative to the importer, and
-`resolveImport` tries that path first. So a package that vendors twill under
-`twill_modules/` reaches the whole terminal layer, exactly the way weft reaches
-`chart` and bobbin reaches `box`. loom now detects capabilities and lights the
-loss value and the bar's fill, dropping to plain text the moment the output is
-piped.
+The resolution was the one predicted here after all. The terminal layer is under
+`std/` now: `std/term/caps`, `std/term/ansi`, `std/term/theme`, alongside
+`color`, `width`, `box` and `frame`. They are ordinary `std/` modules and
+therefore reachable from an installed package with no vendoring and no change to
+the import rule. `src/report.tw` imports the first three, detects capabilities
+and lights the loss value and the bar's fill, dropping to plain text the moment
+the output is piped.
 
-What loom still does not take is `src/cli/progress.tw`'s determinate bar with
-its rate and ETA. That bar is stateful and reads a clock, and wiring it in means
-threading a time source through the trainer, which is a separate change with its
-own correctness surface. Until then loom keeps its own stateless per-epoch bar,
-now lit from the same palette so the two never drift in colour. Duplicating the
-progress *logic* is still rejected for the reason it always was.
+There is no `std/cli` and therefore no determinate bar with a rate and an ETA to
+adopt. loom keeps its own stateless per-epoch bar, lit from the same palette so
+the two never drift in colour. Building the estimate is entry 16, which is now a
+loom work item rather than a language one.
 
 ### 9. `f64` and `i64` conversions, and `F64` as a declared type
 
 **Used by:** `src/metrics.tw` (`update`, `count`), `src/report.tw` (`fixed`),
 `src/callback.tw` (`lr_at`, `pack_state`)
-**Status:** `i64(f)` and `f64(n)` are specified in section 1.2. `F64` as an
-annotation is implied by `Tok.Num(F64)` in the same document and is never
-stated.
+**Status:** DELIVERED. `F64` is a declared type, `i64(f)` and `f64(n)` convert,
+and `Meter.total` is an `F64` and not a rank-0 tensor, so the allocation
+question raised below does not arise.
 
 Systems mode makes annotations mandatory, so a metric value has to be spelled
 something. loom writes `F64` and reads it as "a rank-0 tensor with the tensor
@@ -207,8 +218,9 @@ would want to know about before the interpreter finds out.
 
 **Used by:** everywhere. `src/callback.tw` (`observe` writes `c.wait`),
 `src/trainer.tw` (`fit` writes `r.st.epoch`), `src/metrics.tw` (`update`)
-**Status:** section 1.2 says structs have reference semantics; the systems-mode
-rules for assigning to a field of a parameter are not spelled out.
+**Status:** DELIVERED, and it is the reference answer. `fit` advances the run it
+was given, callbacks record into `State`, and `met.update` mutates a meter in
+place; all three are covered by tests that pass.
 
 loom depends on this more heavily than spool does. If a struct passed to a
 function is copied, then `fit` cannot advance the run it was given, no callback
@@ -246,8 +258,9 @@ know.
 ### 13. A tensor-shaped `Dict` key, or an `Arr[Tensor]`
 
 **Would improve:** `src/trainer.tw` (`predict`)
-**Status:** `Arr[T]` is generic in the design; whether `T` may be `Tensor` is
-not stated.
+**Status:** DELIVERED. `T` may be `Tensor`: `tr.predict` accumulates an
+`Arr[Tensor]` and concatenates once, and `predict_returns_one_row_per_input_row_in_input_order`
+in `tests/trainer_test.tw` runs it. The quadratic fallback below was not needed.
 
 `predict` accumulates per-batch outputs in an `Arr[Tensor]` and concatenates
 once. If `Arr` cannot hold tensors, the fallback is to concatenate as it goes,
@@ -267,27 +280,34 @@ whole body instead.
 ### 15. A test runner
 
 **Would improve:** `tests/`
-**Status:** none. `tests/harness.tw` is a hand-rolled counter and `report` calls
-`exit(1)`.
+**Status:** DELIVERED. `twill test tests` collects `*_test.tw`, runs each in a
+fresh interpreter and reports once, which is exactly what this entry asked for.
+CI calls it and so does the README.
 
-Every test file is a program that has to be run individually, and there is no
-way to run the suite except a shell loop, which the CI workflow does not have
-because there is nothing to loop over yet. A `twill test` that collected
-`*_test.tw`, ran each in a fresh interpreter and reported once would replace
-`tests/harness.tw` entirely, and the same file exists in spool, so the
-duplication is already two deep.
+`tests/harness.tw` is not gone. `twill test` reports a file as passed or failed
+and the harness is what names the individual assertions inside one, so the two
+are complementary rather than one replacing the other. The duplication this
+entry complained about, the same harness in loom and in spool, is unchanged, and
+what would close it is a `std/test` rather than the runner.
 
 ### 16. Timing, for the progress estimate
 
 **Needs:** a monotonic clock, `mono_ms() -> I64`
-**Used by:** `src/report.tw`, which does not have one and therefore reports a
-fill with no estimate
-**Status:** not in the language; see bobbin's `docs/needs.md`, where it is the
-first entry.
+**Used by:** `src/report.tw`, which reports a fill with no estimate
+**Status:** DELIVERED in twill 1.7, and loom has not taken it up. `mono_ns()`
+returns a monotonic nanosecond count and `clock_now_ms()` a wall-clock
+millisecond one. Both were checked against the 1.7.1 binary.
 
-The useful part of a progress bar for a 400-epoch run is the time remaining,
-not the fill. loom cannot compute it. This is the same requirement bobbin has
-and it should be satisfied once.
+So this stops being a language work item and becomes a loom one, and the reason
+it is still open is not the arithmetic. The estimate needs a start time held
+across the run, and a run resumed from a checkpoint at epoch 10 has no start
+time for the first ten epochs; extrapolating as if it did produces a confident
+wrong number, which is worse than the blank this prints today. Threading a time
+source through the trainer with that case handled is the change. Until it is
+written, the README says loom has no estimate and says why, and it no longer
+says twill has no clock, because twill does.
+
+The same requirement is bobbin's first entry, and it should be satisfied once.
 
 ### 17. A dtype as a value, and a name for its type
 

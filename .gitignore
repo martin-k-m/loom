@@ -7,3 +7,7 @@ twill_modules/
 runs/
 *.ckpt
 *.ckpt.best
+
+# tests/checkpoint_test.tw writes a checkpoint into a directory it creates, to
+# prove that writing one creates the directory.
+tests/tmp_*/

@@ -110,7 +110,15 @@ fn build(r: st.Run, cb_state: Arr[F64], rows: I64, note: Str) -> Checkpoint {
   }
 }
 
+# The directory is created before the write. A checkpoint path is a
+# configuration value, usually "runs/something.ckpt", and nothing else in a run
+# has any reason to create "runs/". Without this the whole training run is lost
+# at the first checkpoint, on a failure that has nothing to do with training:
+# `save: open runs/blobs.ckpt.best: The system cannot find the path specified`.
+# `path_dir` returns "." for a bare filename and `mkdir_all` accepts it, so
+# there is no case to special-case.
 fn write(r: st.Run, cb_state: Arr[F64], rows: I64, path: Str, note: Str) -> Str {
+  mkdir_all(path_dir(path))
   save(build(r, cb_state, rows, note), path)
   path
 }
