@@ -87,10 +87,10 @@ jobs:
       # would have. Pinned rather than floating: a green run should mean this
       # code passed against a known compiler, not against whatever was newest
       # that morning.
-      - name: Install twill v1.7.0
+      - name: Install twill v1.7.1
         run: |
           curl -fsSL -o twill \
-            https://github.com/twill-lang/twill/releases/download/v1.7.0/twill-v1.7.0-linux-amd64
+            https://github.com/twill-lang/twill/releases/download/v1.7.1/twill-v1.7.1-linux-amd64
           chmod +x twill
           ./twill --version
 
@@ -121,6 +121,9 @@ jobs:
       # checking one.
       - name: Run the examples
         run: |
-          # The example checkpoints, and `save` will not create the directory.
-          mkdir -p examples/runs
+          # No `mkdir -p examples/runs` here any more. It used to be needed and
+          # it was hiding the defect: src/checkpoint.tw did not create the
+          # directory its path names, so the example worked in CI and aborted
+          # at the first checkpoint for everyone else. `ckpt.write` calls
+          # `mkdir_all` now and tests/checkpoint_test.tw pins it.
           ./twill run examples/classifier.tw > /dev/null

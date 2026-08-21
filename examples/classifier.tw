@@ -2,12 +2,20 @@ mode systems
 
 # A three-class MLP trained with loom, end to end.
 #
-# Run it from the project root, because loom's import paths are relative to the
-# working directory and that is twill's rule rather than loom's:
-#
 #   twill run examples/classifier.tw
 #
-# It does not run. See the README.
+# The working directory does not matter. twill resolves both an import and a
+# relative path argument against the directory of the file that contains it, so
+# the imports below reach ../src/ and everything this file writes lands under
+# examples/, whatever directory you invoke twill from. That is twill's rule
+# rather than loom's.
+#
+# It writes two files, both under examples/runs/:
+#
+#   blobs.ckpt        the periodic checkpoint, and blobs.ckpt.best beside it
+#   blobs.params      the bare parameter tree, which is what selvedge's
+#                     examples/publish.tw consumes. See the README's pipeline
+#                     section for the copy.
 
 import "../src/trainer.tw" as tr
 import "../src/state.tw" as st
@@ -123,6 +131,13 @@ fn main() {
 
   print("trained " + str(run.st.epoch) + " epochs")
   print("best parameters are in " + run.st.best_path)
+
+  # The handoff to selvedge. A checkpoint is not an archive and selvedge does
+  # not read loom's checkpoint format, deliberately; what it takes is a bare
+  # parameter tree, so that is what is written here. selvedge's README explains
+  # the boundary.
+  save(run.params, "runs/blobs.params")
+  print("parameters for selvedge are in runs/blobs.params")
 
   let pred = tr.predict(run.params, parts.val.x, 64, logits)
   print("held-out accuracy " + str(met.accuracy(pred, parts.val.y)))
